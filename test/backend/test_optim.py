@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import unittest
 from tinygrad import Tensor, Device, dtypes
+import tinygrad.nn as nn
 from tinygrad.nn.optim import Adam, SGD, AdamW, Muon, LAMB
 from tinygrad.device import is_dtype_supported
 from test.helpers import needs_second_gpu, slow
@@ -188,6 +189,34 @@ class TestOptim(unittest.TestCase):
     opt.step()
     self.assertEqual(t.device, ds)
     self.assertEqual(opt.m[0].device, "CPU")
+
+class TestOptimRegression(unittest.TestCase):
+  def setUp(self):
+    self.old_training = Tensor.training
+    Tensor.training = True
+
+  def tearDown(self):
+    Tensor.training = self.old_training
+
+  def test_gan_style_detach_two_optimizers(self):
+    # Regression test for issue #14470.
+    net1, net2 = nn.Linear(10, 10), nn.Linear(10, 10)
+    optim1, optim2 = (
+      Adam(nn.state.get_parameters(net1)),
+      Adam(nn.state.get_parameters(net2)),
+    )
+
+    with Tensor.train():
+      out1 = net1(Tensor.randn(5, 10))
+
+      out2 = net2(out1.detach())
+      optim2.zero_grad()
+      out2.sum().backward()
+      optim2.step()
+
+      optim1.zero_grad()
+      out1.sum().backward()
+      optim1.step()
 
 if __name__ == '__main__':
   unittest.main()
