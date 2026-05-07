@@ -2405,7 +2405,7 @@ class Tensor(OpMixin):
     assert self.ndim > 1, f"expected two or more dimensions, got {self.ndim}"
     b_shape, m, n = self.shape[:-2], int(self.shape[-2]), int(self.shape[-1])
     R = self.clone()
-    Q = Tensor.eye(m, dtype=self.dtype).reshape((1,) * len(b_shape) + (m, m)).expand(b_shape + (m, m))
+    Q = Tensor.eye(m, device=self.device, dtype=self.dtype).reshape((1,) * len(b_shape) + (m, m)).expand(b_shape + (m, m))
     for i in range(min(m, n)):
       x = R[..., i:m, i]
       norm = x.square().sum(-1).sqrt()

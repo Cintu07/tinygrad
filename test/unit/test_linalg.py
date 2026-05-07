@@ -1,4 +1,5 @@
 import unittest, functools
+from unittest.mock import patch
 from tinygrad import Tensor, Context
 import numpy as np
 
@@ -12,6 +13,12 @@ def reconstruction_helper(A:list[Tensor],B:Tensor, tolerance=1e-5):
   np.testing.assert_allclose(reconstructed_tensor.numpy(),B.numpy(),atol=tolerance,rtol=tolerance)
 
 class TestLinAlg(unittest.TestCase):
+  def test_qr_preserves_eye_device(self):
+    a = Tensor.randn(3, 3).realize()
+    with patch.object(Tensor, "eye", wraps=Tensor.eye) as mock_eye:
+      a.qr()
+    self.assertEqual(mock_eye.call_args.kwargs["device"], a.device)
+
   @unittest.skip("TODO: reenable this")
   def test_svd_general(self):
     sizes = [(2,2),(5,3),(3,5),(3,4,4),(2,2,2,2,3)]
