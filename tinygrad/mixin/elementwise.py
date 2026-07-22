@@ -923,8 +923,10 @@ class ElementwiseMixin(CreationMixin):
     """
     # https://personal.math.ubc.ca/~cbm/aands/page_81.htm 4.4.46
     coefficients = [-0.0012624911, 0.0066700901, -0.0170881256, 0.0308918810, -0.0501743046, 0.0889789874, -0.2145988016, 1.5707963050]
-    x = math.pi / 2 - (1.0 - self.abs()).sqrt() * polyN(self.abs(), coefficients)
-    return self.sign() * x
+    # NOTE: where-based sign keeps the gradient nonzero at 0, sign()/abs() would zero it
+    s = (self < 0).where(-1.0, 1.0)
+    x = math.pi / 2 - (1.0 - self*s).sqrt() * polyN(self*s, coefficients)
+    return s * x
 
   def acos(self) -> Self:
     """
@@ -1051,8 +1053,10 @@ class ElementwiseMixin(CreationMixin):
     ```
     """
     # https://personal.math.ubc.ca/~cbm/aands/page_299.htm 7.1.26
-    t = 1.0 / (1.0 + 0.3275911 * self.abs())
-    return self.sign() * (1.0 - t * polyN(t, [1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592]) * (-self.square()).exp())
+    # NOTE: where-based sign keeps the gradient nonzero at 0, sign()/abs() would zero it
+    s = (self < 0).where(-1.0, 1.0)
+    t = 1.0 / (1.0 + 0.3275911 * self * s)
+    return s * (1.0 - t * polyN(t, [1.061405429, -1.453152027, 1.421413741, -0.284496736, 0.254829592]) * (-self.square()).exp())
 
   def softsign(self) -> Self:
     """

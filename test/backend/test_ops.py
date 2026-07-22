@@ -935,6 +935,11 @@ class TestOps(unittest.TestCase):
     helper_test_op([(45,65)], lambda x: x.atan())
     helper_test_op([(45,65)], lambda x: x.atan(), low=-300, high=-297)
     helper_test_op([(45,65)], lambda x: x.atan(), low=300, high=303)
+  def test_inverse_trig_erf_grad_at_zero(self):
+    helper_test_op(None, lambda x: x.asin(), vals=[[-0.5, 0.0, 0.5]], grad_atol=1e-3)
+    helper_test_op(None, lambda x: x.acos(), vals=[[-0.5, 0.0, 0.5]], grad_atol=1e-3)
+    helper_test_op(None, lambda x: x.atan(), vals=[[-0.5, 0.0, 0.5]], grad_atol=1e-3)
+    helper_test_op(None, torch.erf, Tensor.erf, vals=[[-0.5, 0.0, 0.5]], grad_atol=1e-3)
 
   def test_relu(self):
     helper_test_op([(64,64)], lambda x: x.relu())
