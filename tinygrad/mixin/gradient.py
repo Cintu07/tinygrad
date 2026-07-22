@@ -7,7 +7,13 @@ from tinygrad.dtype import sum_acc_dtype
 def reduce_gradient(ctx:UOp, ret:UOp, op:Ops):
   if op == Ops.ADD: return (ctx._broadcast_to(ret.src[0].shape),)
   if op == Ops.MAX: return (((mask:=ret.src[0].eq(ret).cast(ctx.dtype))/mask._rop(Ops.ADD, tuple(range(ret.arg[1])))) * ctx,)
-  if op == Ops.MUL: return (ctx * ret / ret.src[0],)
+  if op == Ops.MUL:
+    # prod/x is nan at x==0, so handle zeros: grad is prod-of-rest at a lone zero, else 0
+    iszero = ret.src[0].eq(ret.src[0].const_like(0))
+    safe = iszero.where(ret.src[0].const_like(1), ret.src[0])
+    g = ctx * safe._rop(Ops.MUL, tuple(range(ret.arg[1])))
+    nz = iszero.cast(ctx.dtype)._rop(Ops.ADD, tuple(range(ret.arg[1])))
+    return (iszero.where(nz.eq(1).where(g, g.const_like(0)), nz.eq(0).where(g/safe, g.const_like(0))),)
 
 def _compact_params(body:UOp, all_args:tuple[UOp, ...]) -> tuple[UOp, tuple[UOp, ...]]:
   """Remove unused PARAMs from body and return compacted (body, args)."""

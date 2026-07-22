@@ -1532,6 +1532,11 @@ class TestOps(unittest.TestCase):
     helper_test_op([()], lambda x: x.prod(0))
     helper_test_op([()], lambda x: x.prod(-1))
 
+  def test_prod_with_zero(self):
+    helper_test_op(None, lambda x: x.prod(), vals=[[1.0, 2.0, 0.0, 4.0]])
+    helper_test_op(None, lambda x: x.prod(), vals=[[1.0, 0.0, 0.0, 4.0]])
+    helper_test_op(None, lambda x: x.prod(axis=1), vals=[[[1.0, 2.0, 0.0], [3.0, 4.0, 5.0]]])
+
   def test_prod_dtype_arg(self):
     with self.assertRaises(AttributeError): Tensor([1.0, 2.0]).prod(dtype="")
 
