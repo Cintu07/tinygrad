@@ -1,6 +1,7 @@
 # Adreno A630 IR3 compute shader emulator. Bit layouts follow mesa's isaspec (src/freedreno/isa/ir3-cat*.xml, mesa 25.2.7).
 from __future__ import annotations
 import ctypes, functools, struct
+from typing import Callable
 from dataclasses import dataclass, field
 import numpy as np
 from tinygrad.helpers import unwrap
@@ -27,6 +28,7 @@ CAT0_BR = {0: "br", 1: "brao", 2: "braa", 4: "bany", 5: "ball"}
 CAT0_LO = {0: "nop", 2: "jump", 3: "call", 4: "ret", 5: "kill", 6: "end", 7: "emit", 8: "cut", 9: "chmask", 10: "chsh", 11: "flow_rev"}
 CAT0_HI = {0: "bkt", 5: "getone", 7: "shps", 8: "shpe", 13: "predt", 14: "predf", 15: "prede"}
 CAT6 = {0: "ldg", 1: "ldl", 2: "ldp", 3: "stg", 4: "stl", 5: "stp"}
+ATOMICS = {16: "add", 17: "sub", 18: "xchg", 19: "inc", 20: "dec", 21: "cmpxchg", 22: "min", 23: "max", 24: "and", 25: "or", 26: "xor"}
 # mesa's #flut table for (1.0)-style float immediates
 FLUT = [0.0, 0.5, 1.0, 2.0, 2.718281828459045, 3.141592653589793, 0.3183098861837907, 1 / 1.4426950408889634, 1.4426950408889634,
         1 / 3.321928094887362, 3.321928094887362, 4.0]  # 7 is 1/log2(e), 8 is log2(e), 9 is 1/log2(10), 10 is log2(10)
@@ -164,7 +166,12 @@ def decode_one(pc:int, w:int) -> Inst:
     i.name = CAT6.get(opc, f"cat6.{opc}")
     i.extra.update(type=TYPES[t], type_half=t in (0, 2, 4, 6))
     i.raw["TYPE"] = t
-    if i.name == "ldg":
+    if opc in ATOMICS:  # ir3-cat6.xml #instruction-cat6-a3xx-atomic, bit 52 is global (.g) or local (.l)
+      if bits(w, 22, 23): raise NotImplementedError("atomic with an immediate source")
+      i.name = f"atomic.{'g.' if bits(w, 52, 52) else ''}{ATOMICS[opc]}"
+      i.dst, i.srcs = bits(w, 32, 39), [Src("r", bits(w, 14, 21)), Src("r", bits(w, 24, 31))]  # address, value
+      i.raw.update(DST=i.dst, SRC1=bits(w, 14, 21), SRC2=bits(w, 24, 31))
+    elif i.name == "ldg":
       if bits(w, 22, 22): raise NotImplementedError("ldg reg-offset form")
       i.dst, i.extra["off"], i.extra["size"] = bits(w, 32, 39), sext(bits(w, 1, 13), 13), bits(w, 24, 26)
       i.srcs = [Src("r", bits(w, 14, 21))]
@@ -472,7 +479,7 @@ def run_wave(insts:list[Inst], w:Wave, budget:int=1 << 24):
       elif i.cat in (2, 3, 4):
         outs = [_alu(i, w, k) for k in range(i.repeat + 1)]  # read everything first, (rptN) groups behave as parallel moves
         for k, v in enumerate(outs): w.write_bits(unwrap(i.dst) + k, i.dst_half, v)
-      elif i.cat == 6: (_image_store if n == "stib.b" else _memory)(i, w)
+      elif i.cat == 6: (_image_store if n == "stib.b" else _atomic if n.startswith("atomic.") else _memory)(i, w)
       elif i.cat == 5: _image_load(i, w)
       elif i.cat == 7 and n == "bar":
         parked |= sel
@@ -524,6 +531,31 @@ def _memory(i:Inst, w:Wave):
 def _gather_srcs(i:Inst, w:Wave, lanes:np.ndarray, size:int, half:bool, raw) -> np.ndarray:
   vals = np.stack([w.read_bits(Src("r", i.srcs[1].val + k, half))[lanes] for k in range(size)], 1)
   return np.ascontiguousarray(vals.astype(raw)).view(np.uint8).reshape(len(lanes), -1)
+
+ATOMIC_OPS: dict[str, Callable[[int, int], int]] = {"add": lambda x, y: x + y, "min": min, "max": max, "and": lambda x, y: x & y,
+                                                    "or": lambda x, y: x | y, "xor": lambda x, y: x ^ y, "xchg": lambda x, y: y}
+
+def _atomic(i:Inst, w:Wave):
+  # the u32/s32 atomics mesa emits for global and shared memory (ir3_a6xx.c emit_intrinsic_atomic_global, ir3_compiler_nir.c
+  # emit_intrinsic_atomic_shared). lanes run one after another: each reads the old value into dst and writes op(old, value)
+  op, glob = i.name.rsplit(".", 1)[1], i.name.startswith("atomic.g.")
+  if op not in ATOMIC_OPS: raise EmuError(f"{i.name}: mesa doesn't emit it, or its operand order is unconfirmed (cmpxchg)")
+  if i.extra["type"] not in ("u32", "s32"): raise EmuError(f"{i.name}.{i.extra['type']} not supported")
+  t, a, v = np.dtype(np.int32 if i.extra["type"] == "s32" else np.uint32), i.srcs[0].val, i.srcs[1].val
+  old = w.reg[unwrap(i.dst)].copy()
+  for lane in np.nonzero(w.mask())[0]:
+    if glob:
+      ptr = np.array([int(w.reg[a, lane]) | int(w.reg[a + 1, lane]) << 32], np.uint64)
+      cur = w.mem.load(ptr, 4).view(t)[0, 0]
+    else:
+      if (at := int(w.reg[a, lane])) + 4 > w.local.shape[1]:
+        w.local = np.concatenate([w.local, np.zeros((len(w.local), max(at + 4, 2 * w.local.shape[1]) - w.local.shape[1]), np.uint8)], 1)
+      cur = w.local[w.group[lane], at:at + 4].view(t)[0]
+    new = np.array([ATOMIC_OPS[op](int(cur), int(w.reg[v, lane:lane + 1].view(t)[0])) & 0xffffffff], np.uint32).view(np.uint8)
+    if glob: w.mem.store(ptr, new.reshape(1, 4))
+    else: w.local[w.group[lane], at:at + 4] = new
+    old[lane] = np.array(cur, t).view(np.uint32)
+  w.write_bits(unwrap(i.dst), False, old)
 
 def _field(val:int, name:str) -> int: return (val & getattr(mesa, name + "__MASK")) >> getattr(mesa, name + "__SHIFT")
 

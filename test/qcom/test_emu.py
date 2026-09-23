@@ -3,7 +3,7 @@
 import unittest, ctypes, struct, tempfile
 import numpy as np
 from tinygrad.runtime.autogen import mesa, libc
-from test.mockgpu.qcom.emu import decode_one, Wave, run_wave
+from test.mockgpu.qcom.emu import decode_one, Wave, run_wave, HostMemory, EmuError
 
 END = 0x0300000000000000
 
@@ -16,9 +16,9 @@ def mesa_disasm(word:int) -> str:
     tf.seek(0)
     return tf.read().splitlines()[0].strip()
 
-def run(word:int, text:str, regs=None, hregs=None, consts=None, n=4) -> Wave:
+def run(word:int, text:str, regs=None, hregs=None, consts=None, n=4, mem=None, group=None) -> Wave:
   assert mesa_disasm(word) == text, f"{word:016x} is {mesa_disasm(word)!r}, not {text!r}"
-  w = Wave(n, np.zeros(256, np.uint32) if consts is None else consts, None, np.zeros(n, np.int64), False)
+  w = Wave(n, np.zeros(256, np.uint32) if consts is None else consts, mem, np.zeros(n, np.int64) if group is None else np.array(group), False)
   for r, v in (regs or {}).items(): w.reg[r] = np.array(v, np.int64).astype(np.uint32)
   for r, v in (hregs or {}).items(): w.hreg[r] = np.array(v, np.int64).astype(np.uint16)
   run_wave([decode_one(0, word), decode_one(1, END)], w)
@@ -92,6 +92,33 @@ class TestQCOMEmu(unittest.TestCase):
   def test_fence(self):
     w = run(0xe0fa000000000000, "fence.g.l.r.w", regs={0: [1, 2, 3, 4]})
     np.testing.assert_equal(w.reg[0], [1, 2, 3, 4])
+
+  def _global(self, word, text, init, vals, dtype):
+    # every lane hits the same address: r0.x/r0.y is the 64 bit address, r0.z the value and the old value comes back in r0.z
+    buf = np.array([init], dtype)
+    w = run(word, text, regs={0: [buf.ctypes.data & 0xffffffff]*4, 1: [buf.ctypes.data >> 32]*4, 2: vals}, mem=HostMemory({buf.ctypes.data: 4}))
+    return buf[0], w.reg[2].view(dtype)
+
+  def test_atomic_g_add(self):
+    final, old = self._global(0xc416000202000001, "atomic.g.add.untyped.1d.u32.1.g r0.z, r0.x, r0.z", 10, [1, 2, 3, 4], np.uint32)
+    self.assertEqual(final, 20)
+    np.testing.assert_equal(old, [10, 11, 13, 16])
+
+  def test_atomic_g_max_s32(self):
+    # atomic.g.add's word with the opcode (bits 54-58) set to max and the type (bits 49-51) to s32, what mesa emits for imax
+    final, old = self._global(0xc5da000202000001, "atomic.g.max.untyped.1d.s32.1.g r0.z, r0.x, r0.z", -5, [-10, 3, -1, 7], np.int32)
+    self.assertEqual(final, 7)
+    np.testing.assert_equal(old, [-5, -5, 3, 3])
+
+  def test_atomic_local_max_per_workgroup(self):
+    w = run(0xd5c6000303008001, "(sy)atomic.max.untyped.1d.u32.1.l r0.w, l[r0.z], r0.w", regs={2: [0]*4, 3: [5, 9, 2, 1]}, group=[0, 0, 1, 1])
+    np.testing.assert_equal(w.reg[3], [0, 5, 0, 2])
+    np.testing.assert_equal(w.local[:, :4].copy().view(np.uint32).reshape(-1), [9, 2])
+
+  def test_atomic_cmpxchg_refuses(self):
+    # the compare/value order of the register pair isn't confirmed, so the emulator raises instead of guessing
+    with self.assertRaises(EmuError):
+      self._global(0xc556000202000001, "atomic.g.cmpxchg.untyped.1d.u32.1.g r0.z, r0.x, r0.z", 0, [0]*4, np.uint32)
 
 if __name__ == "__main__":
   unittest.main()
