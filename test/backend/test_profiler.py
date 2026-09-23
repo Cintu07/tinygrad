@@ -146,6 +146,7 @@ class TestProfiler(unittest.TestCase):
     try: d1 = Device[f"{Device.DEFAULT}:1"]
     except Exception as e: self.skipTest(f"second device not available {e}")
     if Device.DEFAULT == "CUDA": self.skipTest("CUDA has no p2p: a transfer is two staged copies")
+    if Device.DEFAULT == "QCOM": self.skipTest("QCOM copies on the host: no copies in the graph")
 
     def f(a):
       x = (a + 1).realize()

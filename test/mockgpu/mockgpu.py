@@ -1,15 +1,28 @@
-import ctypes, time, os, builtins, fcntl, typing
-from tinygrad.helpers import DEV
+import ctypes, time, os, builtins, fcntl, typing, traceback
+from tinygrad.helpers import DEV, unwrap
 from tinygrad.runtime.support.system import FileIOInterface
 from tinygrad.runtime.autogen import libc
 from test.mockgpu.nv.nvdriver import NVDriver
 from test.mockgpu.amd.amddriver import AMDDriver
 from test.mockgpu.am.amdriver import AMDriver, AMUSBDriver
+from test.mockgpu.qcom.qcomdriver import QCOMDriver
 start = time.perf_counter()
 
 drivers = [cls() for t in DEV.value if (cls:={"MOCKPCI+AMD": AMDriver, "MOCKKFD+AMD": AMDDriver, "MOCK+AMD": AMDDriver, "MOCKUSB+AMD": AMUSBDriver,
-                                              "MOCK+NV": NVDriver}.get(f"{t.interface}+{t.device}"))]
+                                              "MOCK+NV": NVDriver, "MOCK+QCOM": QCOMDriver}.get(f"{t.interface}+{t.device}"))]
 tracked_fds: dict[int, typing.Any] = {}
+
+# hcq2 ccall runs libc's ioctl from generated code instead of FileIOInterface.ioctl, so route fake fds to their driver there too
+_ioctl_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p)
+_real_ioctl = _ioctl_t(unwrap(ctypes.cast(getattr(libc.dll, "ioctl"), ctypes.c_void_p).value))
+def _ioctl(fd, request, argp):
+  try: return tracked_fds[fd].ioctl(fd, request, argp) if fd in tracked_fds else _real_ioctl(fd, request, argp)
+  except Exception:
+    traceback.print_exc()  # exceptions can't propagate into the generated code that called us
+    return -1
+_mock_ioctl = _ioctl_t(_ioctl)
+for k, v in {"__name__": "ioctl", "__module__": "tinygrad.runtime.autogen.libc"}.items(): setattr(_mock_ioctl, k, v)  # ccall reads these
+setattr(libc.dll, "ioctl", _mock_ioctl)
 
 original_memoryview = builtins.memoryview
 class TrackedMemoryView:
