@@ -307,6 +307,8 @@ def _kind(name:str) -> str:
 def _cmp(cond:str, a:np.ndarray, b:np.ndarray) -> np.ndarray:
   return {"lt": a < b, "le": a <= b, "gt": a > b, "ge": a >= b, "eq": a == b, "ne": a != b}[cond]
 
+def _bits(a:np.ndarray) -> np.ndarray: return np.unpackbits(np.ascontiguousarray(a).view(np.uint8), bitorder="little").reshape(len(a), -1)
+
 def _alu(i:Inst, w:Wave, off:int) -> np.ndarray:
   k = _kind(i.name)
   vals = []
@@ -349,12 +351,16 @@ def _alu(i:Inst, w:Wave, off:int) -> np.ndarray:
   elif n == "mull.u": r = ((a.astype(np.uint64) & (0xff if half else 0xffff)) * (b.astype(np.uint64) & (0xff if half else 0xffff))).astype(ut)
   elif n == "mul.s24": r = ((a.astype(np.int64) << 40 >> 40) * (b.astype(np.int64) << 40 >> 40)).astype(ut)
   elif n == "mul.u24": r = ((a.astype(np.uint64) & 0xffffff) * (b.astype(np.uint64) & 0xffffff)).astype(ut)
+  # nir bitfield_reverse and bit_count (ir3_compiler_nir.c), a6xx counts the bits of a 32 bit value as two 16 bit halves
+  elif n == "bfrev.b": r = np.packbits(_bits(a)[:, ::-1], axis=1, bitorder="little").view(ut).reshape(-1)
+  elif n == "cbits.b": r = _bits(a).sum(1).astype(ut)
   elif n == "shl.b": r = a << (b & ut(sh))
   elif n == "shr.b": r = a >> (b & ut(sh))
   elif n == "ashr.b": r = (a.view(st) >> (b & ut(sh)).view(st)).view(ut)
   # cat3, operands are (src1, src2, src3) in isaspec order
   elif n in ("mad.f32", "mad.f16", "mad.u16", "mad.s16"): r = a * b + c
   elif n == "madsh.m16": r = ((a.astype(np.uint64) & 0xffff) * ((b.astype(np.uint64) >> 16) & 0xffff) << 16).astype(ut) + c
+  elif n == "mad.s24": r = ((a.astype(np.int64) << 40 >> 40) * (b.astype(np.int64) << 40 >> 40) + c).astype(ut)  # nir imad24_ir3
   elif n.startswith("sel."): r = np.where(b != 0, a, c)
   elif n == "shrg": r = (b >> (a & ut(sh))) | c
   elif n == "shlg": r = (b << (a & ut(sh))) | c
@@ -471,6 +477,7 @@ def run_wave(insts:list[Inst], w:Wave, budget:int=1 << 24):
       elif i.cat == 7 and n == "bar":
         parked |= sel
         continue
+      elif i.cat == 7 and n == "fence": pass  # every memory access is applied in program order, there is nothing to reorder
       else: raise EmuError(f"{n} (cat{i.cat}) not implemented")
       pc[sel] = nxt
 

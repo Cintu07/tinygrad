@@ -662,6 +662,8 @@ jobs:
           deps: "testing_unit mesa"
       - name: Check Device.DEFAULT
         run: python3 -c "from tinygrad import Device; assert Device.DEFAULT == 'QCOM', Device.DEFAULT"
+      - name: Run emulator instruction tests
+        run: python -m pytest -n=auto test/qcom/
       - name: Run pytest (qcom)
         run: python -m pytest -n=auto test/backend --ignore test/backend/test_multitensor.py --durations=20
 
