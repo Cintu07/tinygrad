@@ -4,7 +4,7 @@ from test.mockgpu.gpu import VirtGPU
 from test.mockgpu.qcom import emu
 
 CP_NAMES = {getattr(mesa, n): n for n in ("CP_SET_MARKER", "CP_WAIT_FOR_IDLE", "CP_WAIT_MEM_WRITES", "CP_EVENT_WRITE", "CP_REG_TO_MEM",
-                                          "CP_WAIT_REG_MEM", "CP_LOAD_STATE6_FRAG", "CP_EXEC_CS")}
+                                          "CP_WAIT_REG_MEM", "CP_LOAD_STATE6_FRAG", "CP_EXEC_CS", "CP_RUN_OPENCL")}
 
 def _field(val:int, name:str) -> int: return (val & getattr(mesa, name + "__MASK")) >> getattr(mesa, name + "__SHIFT")
 def _u64(words:list[int], i:int) -> int: return words[i] | words[i + 1] << 32
@@ -66,6 +66,11 @@ class QCOMGPU(VirtGPU):
                  tuple(_field(nd, f"A6XX_SP_CS_NDRANGE_0_LOCALSIZE{a}") + 1 for a in "XYZ"),
                  _field(cc, "A6XX_SP_CS_CONST_CONFIG_0_LOCALIDREGID"), _field(cc, "A6XX_SP_CS_CONST_CONFIG_0_WGIDCONSTID"),
                  bool(self.regs[mesa.REG_A6XX_SP_CS_CNTL_0] & mesa.A6XX_SP_CS_CNTL_0_MERGEDREGS), self.mapped,
-                 (self._reg64(mesa.REG_A6XX_SP_CS_TEXMEMOBJ_BASE), self._reg64(mesa.REG_A6XX_SP_CS_UAV_BASE)))
+                 (self._reg64(mesa.REG_A6XX_SP_CS_TEXMEMOBJ_BASE), self._reg64(mesa.REG_A6XX_SP_CS_UAV_BASE)),
+                 self.regs[mesa.REG_A6XX_SP_CS_PROGRAM_COUNTER_OFFSET],
+                 bool(self.regs[mesa.REG_A6XX_SP_MODE_CNTL] & mesa.A6XX_SP_MODE_CNTL_CONSTANT_DEMOTION_ENABLE))
+
+  # the CL path launches the whole ndrange: the group counts are SP_CS_KERNEL_GROUP_X/Y/Z, written right after SP_CS_NDRANGE
+  def _cp_run_opencl(self, p:list[int]): self._cp_exec_cs([0] + [self.regs[mesa.REG_A6XX_SP_CS_KERNEL_GROUP_X + i] for i in range(3)])
 
   def _reg64(self, reg:int) -> int: return self.regs.get(reg, 0) | self.regs.get(reg + 1, 0) << 32

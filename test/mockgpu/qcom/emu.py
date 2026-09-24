@@ -2,7 +2,7 @@
 from __future__ import annotations
 import ctypes, functools, struct
 from typing import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import numpy as np
 from tinygrad.helpers import unwrap
 from tinygrad.runtime.autogen import mesa
@@ -171,13 +171,22 @@ def decode_one(pc:int, w:int) -> Inst:
       i.name = f"atomic.{'g.' if bits(w, 52, 52) else ''}{ATOMICS[opc]}"
       i.dst, i.srcs = bits(w, 32, 39), [Src("r", bits(w, 14, 21)), Src("r", bits(w, 24, 31))]  # address, value
       i.raw.update(DST=i.dst, SRC1=bits(w, 14, 21), SRC2=bits(w, 24, 31))
+    elif i.name == "ldg" and bits(w, 22, 22):  # ldg.a: g[src1 + (((src2 << SRC2_SHIFT) + OFF) << TYPE_SHIFT)]
+      i.name, i.dst, i.extra["size"] = "ldg.a", bits(w, 32, 39), bits(w, 24, 26)
+      i.extra.update(off=bits(w, 9, 10), shift=bits(w, 12, 13))
+      i.srcs = [Src("r", bits(w, 14, 21)), Src("r", bits(w, 1, 8))]
+      i.raw.update(DST=i.dst, SRC1=bits(w, 14, 21), SRC2=bits(w, 1, 8), OFF=i.extra["off"], SRC2_SHIFT=i.extra["shift"], SIZE=i.extra["size"])
     elif i.name == "ldg":
-      if bits(w, 22, 22): raise NotImplementedError("ldg reg-offset form")
       i.dst, i.extra["off"], i.extra["size"] = bits(w, 32, 39), sext(bits(w, 1, 13), 13), bits(w, 24, 26)
       i.srcs = [Src("r", bits(w, 14, 21))]
       i.raw.update(DST=i.dst, SRC1=bits(w, 14, 21), OFF=i.extra["off"], SIZE=i.extra["size"])
+    elif i.name == "stg" and bits(w, 52, 52):  # stg.a, addressed like ldg.a
+      i.name, i.extra["size"] = "stg.a", bits(w, 24, 26)
+      i.extra.update(off=bits(w, 9, 10), shift=bits(w, 12, 13))
+      i.srcs = [Src("r", bits(w, 41, 48)), Src("r", bits(w, 1, 8), i.extra["type_half"]), Src("r", bits(w, 32, 39))]  # address, value, offset
+      i.raw.update(SRC1=bits(w, 41, 48), SRC2=bits(w, 32, 39), SRC3=bits(w, 1, 8), OFF=i.extra["off"], SRC2_SHIFT=i.extra["shift"],
+                   SIZE=i.extra["size"])
     elif i.name == "stg":
-      if bits(w, 52, 52): raise NotImplementedError("stg reg-offset form")
       i.extra["off"] = sext(bits(w, 9, 13) << 8 | bits(w, 32, 39), 13)
       i.extra["size"] = bits(w, 24, 26)
       i.srcs = [Src("r", bits(w, 41, 48)), Src("r", bits(w, 1, 8), i.extra["type_half"])]  # address, value
@@ -221,7 +230,7 @@ def decode(image:bytes) -> list[Inst]:
 # 2N+1 (high 16 bits) (ir3_ra.h ra_physreg_to_num). tinygrad compiles with mergedregs=false and leaves the bit clear.
 
 REG_A0, REG_P0, NSCALARS = 61 * 4, 62 * 4, 64 * 4
-FLOAT_OPS = {"add.f", "min.f", "max.f", "mul.f", "sign.f", "cmps.f", "absneg.f", "floor.f", "ceil.f", "rndne.f", "rndaz.f", "trunc.f",
+FLOAT_OPS = {"add.f", "min.f", "max.f", "mul.f", "sign.f", "cmps.f", "cmpv.f", "absneg.f", "floor.f", "ceil.f", "rndne.f", "rndaz.f", "trunc.f",
              "mad.f16", "mad.f32", "sel.f16", "sel.f32", "rcp", "rsq", "log2", "exp2", "sin", "cos", "sqrt", "hrsq", "hlog2", "hexp2"}
 BIT_OPS = {"and.b", "or.b", "not.b", "xor.b"}
 LOAD_T = {"f16": np.float16, "f32": np.float32, "u16": np.uint16, "u32": np.uint32, "s16": np.int16, "s32": np.int32, "u8": np.uint8}
@@ -239,6 +248,7 @@ class Wave:
     self.pred_mode, self.pred_mask = np.zeros(n, np.int8), np.ones(n, bool)  # per lane: 0 none, 1 predt, 2 predf
     self.m = np.ones(n, bool)  # lanes an instruction writes for: active and not blocked by predication
     self.images = (0, 0)       # texture and image (UAV) descriptor base addresses
+    self.demote = True         # SP_MODE_CNTL CONSTANT_DEMOTION_ENABLE
 
   def mask(self) -> np.ndarray: return self.m  # set by run_wave once per step
 
@@ -255,14 +265,20 @@ class Wave:
       if not self.merged: return self.hreg[num]
       return ((self.reg[num >> 1] >> (16 * (num & 1))) & 0xffff).astype(np.uint16)
     if s.kind == "c":
-      # constants are one 32 bit file, a half read of slot N reads slot N (not N>>1 like merged registers). mesa's lower_immed (ir3_cp.c)
-      # stores half immediates of cat2/cat3 float opcodes as float32 values, the read narrows them. every other half read is the low 16 bits
-      c = self.consts[s.val + (off if s.r else 0)]
+      # with SP_MODE_CNTL CONSTANT_DEMOTION_ENABLE (ops_qcom sets it for ir3) a half read of slot N reads 32 bit slot N: mesa's lower_immed
+      # (ir3_cp.c) stores half immediates of cat2/cat3 float opcodes as float32 values and the read narrows them, every other half read is
+      # the low 16 bits. without it the file is packed halves: qualcomm's cl compiler reads the halves of c24.y as hc48.z and hc48.w
+      num = s.val + (off if s.r else 0)
+      if s.half and not self.demote: return np.full(self.n, (int(self.consts[num >> 1]) >> 16 * (num & 1)) & 0xffff, np.uint16)
+      c = self.consts[num]
       if not s.half: return np.full(self.n, c, np.uint32)
       return np.full(self.n, np.array(c, np.uint32).view(np.float32).astype(np.float16).view(np.uint16) if fl else c & 0xffff, np.uint16)
     if s.kind == "imm": return np.full(self.n, s.val & (0xffff if s.half else 0xffffffff), np.uint16 if s.half else np.uint32)
     if s.kind == "flut": return np.full(self.n, s.fval, np.float16 if s.half else np.float32).view(np.uint16 if s.half else np.uint32)
     if s.kind == "rel_c":
+      if s.half and not self.demote:
+        idx = self._rel_index(s.val + (off if s.r else 0), 2 * len(self.consts))
+        return ((self.consts[idx >> 1] >> (16 * (idx & 1)).astype(np.uint32)) & 0xffff).astype(np.uint16)
       idx = self._rel_index(s.val + (off if s.r else 0), len(self.consts))
       c = self.consts[idx]
       if not s.half: return c.astype(np.uint32)
@@ -319,10 +335,16 @@ def _bits(a:np.ndarray) -> np.ndarray: return np.unpackbits(np.ascontiguousarray
 def _alu(i:Inst, w:Wave, off:int) -> np.ndarray:
   k = _kind(i.name)
   vals = []
-  for s in i.srcs:
+  # qualcomm's cl compiler multiplies 16 bit pieces of full registers with mad.u16 r3.x, hr2.x, hr3.x, hr2.y (a full dst). its sin only
+  # writes those as full registers, and reading r2.x, r3.x and r2.y there is what makes sin right past pi/2
+  for s in ([replace(s, half=False) for s in i.srcs] if i.name == "mad.u16" and not i.dst_half else i.srcs):
     b = w.read_bits(s, off, fl=k == "f" and i.cat in (2, 3))
     vals.append(_absneg(_as(b, "u" if k == "b" else k), s.absneg, k))
   half = vals[0].dtype.itemsize == 2
+  # the 24 bit multiplies always give a 32 bit product, also from half sources: qualcomm's cl compiler stores (uint)ushort * (uint)ushort
+  # straight from mul.u24 r0.w, hr0.x, hr0.y. other ops work at the source width and DST_CONV widens the result (mesa's half add.u
+  # into a full register has to wrap at 16 bits for tinygrad's half sin)
+  if half and not i.dst_half and i.name in ("mul.u24", "mul.s24"): vals, half = [v.astype(np.int32 if k == "s" else np.uint32) for v in vals], False
   ut, st, ft = (np.uint16, np.int16, np.float16) if half else (np.uint32, np.int32, np.float32)
   n, a = i.name, vals[0]
   b, c = vals[1] if len(vals) > 1 else a, vals[2] if len(vals) > 2 else a  # one and two source ops never read the missing operands
@@ -334,9 +356,13 @@ def _alu(i:Inst, w:Wave, off:int) -> np.ndarray:
   elif n == "max.f": r = np.fmax(a, b)
   elif n in ("min.u", "min.s"): r = np.minimum(a, b)
   elif n in ("max.u", "max.s"): r = np.maximum(a, b)
-  elif n in ("cmps.f", "cmps.u", "cmps.s"):  # booleans may be written at the other precision (DST_CONV), e.g. cmps.u.lt hr0.x, r3.z, r4.z
+  # booleans may be written at the other precision (DST_CONV), e.g. cmps.u.lt hr0.x, r3.z, r4.z. true is 1 for cmps and all ones for cmpv:
+  # qualcomm's cl compiler stores an opencl scalar compare (1) straight from cmps and a vector compare (-1) straight from cmpv.
+  # (sat) inverts the result: its sin takes the short path for |x| <= pi/2 after (sat)cmps.f.le p0.x, (abs)r2.x, c27.x (pi/2) is false
+  elif n[:5] in ("cmps.", "cmpv."):
     assert i.cond is not None
-    return _cmp(i.cond, a, b).astype(np.uint16 if i.dst_half else np.uint32)
+    r = (_cmp(i.cond, a, b) ^ i.sat).astype(np.uint16 if i.dst_half else np.uint32)
+    return r if n[3] == "s" else -r
   elif n in ("absneg.f", "absneg.s"): r = a
   elif n == "sign.f": r = np.where(a > 0, ft(1), np.where(a < 0, ft(-1), ft(0))).astype(ft)
   elif n == "floor.f": r = np.floor(a)
@@ -361,14 +387,25 @@ def _alu(i:Inst, w:Wave, off:int) -> np.ndarray:
   # nir bitfield_reverse and bit_count (ir3_compiler_nir.c), a6xx counts the bits of a 32 bit value as two 16 bit halves
   elif n == "bfrev.b": r = np.packbits(_bits(a)[:, ::-1], axis=1, bitorder="little").view(ut).reshape(-1)
   elif n == "cbits.b": r = _bits(a).sum(1).astype(ut)
+  # qualcomm's cl compiler keeps a per element mask built with or.b of powers of two and tests bit k with getbit.b p0.y, hr2.y, h(k)
+  elif n == "getbit.b": r = (a >> (b & ut(sh))) & ut(1)
   elif n == "shl.b": r = a << (b & ut(sh))
   elif n == "shr.b": r = a >> (b & ut(sh))
   elif n == "ashr.b": r = (a.view(st) >> (b & ut(sh)).view(st)).view(ut)
   # cat3, operands are (src1, src2, src3) in isaspec order
-  elif n in ("mad.f32", "mad.f16", "mad.u16", "mad.s16"): r = a * b + c
-  elif n == "madsh.m16": r = ((a.astype(np.uint64) & 0xffff) * ((b.astype(np.uint64) >> 16) & 0xffff) << 16).astype(ut) + c
+  elif n in ("mad.f32", "mad.f16", "mad.s16"): r = a * b + c
+  elif n == "mad.u16": r = (a & ut(0xffff)) * (b & ut(0xffff)) + c
+  # qualcomm's cl compiler builds a 32 bit product like mesa does, mull.u then madsh.u16(a, b) and madsh.u16(b, a), where mesa uses madsh.m16.
+  # mod 2**32 a cross product shifted by 16 doesn't depend on the signedness of the halves, and the swapped pair doesn't depend on their order
+  elif n in ("madsh.m16", "madsh.u16"): r = ((a.astype(np.uint64) & 0xffff) * ((b.astype(np.uint64) >> 16) & 0xffff) << 16).astype(ut) + c
   elif n == "mad.s24": r = ((a.astype(np.int64) << 40 >> 40) * (b.astype(np.int64) << 40 >> 40) + c).astype(ut)  # nir imad24_ir3
-  elif n.startswith("sel."): r = np.where(b != 0, a, c)
+  # a + b + c after the source modifiers: mesa emits it for iadd3 (ir3_compiler_nir.c), qualcomm's cl compiler sign extends a 64 bit
+  # address with sad.s32 hi, c, (neg)(off >> 31), carry, which is only right as a sum
+  elif n in ("sad.s16", "sad.s32"): r = a + b + c
+  # sel.b* tests != 0 (mesa's bcsel). sel.s* and sel.f* pick src1 when the condition is >= 0: qualcomm's cl compiler turns opencl's vector
+  # select(a, b, c), which is b where c's top bit is set, into sel.s32 a, c, b, and its sin picks the sign with sel.f32 the same way
+  elif n.startswith("sel.b"): r = np.where(b != 0, a, c)
+  elif n.startswith("sel."): r = np.where(b >= 0, a, c)
   elif n == "shrg": r = (b >> (a & ut(sh))) | c
   elif n == "shlg": r = (b << (a & ut(sh))) | c
   elif n == "shrm": r = (b >> (a & ut(sh))) & c
@@ -398,7 +435,7 @@ def _alu(i:Inst, w:Wave, off:int) -> np.ndarray:
   return r.astype(r.dtype if r.dtype in (np.float16, np.float32) else (np.uint16 if half else np.uint32)).view(np.uint16 if half else np.uint32) \
     if r.dtype.kind == "f" else r.astype(np.uint16 if half else np.uint32)
 
-def _convert(bits_:np.ndarray, st:str, dt:str) -> np.ndarray:
+def _convert(bits_:np.ndarray, st:str, dt:str, rne:bool=False) -> np.ndarray:
   src_t = LOAD_T.get(st)
   if src_t is None: raise EmuError(f"cov from {st}")
   if st == "u8":
@@ -408,7 +445,7 @@ def _convert(bits_:np.ndarray, st:str, dt:str) -> np.ndarray:
     v = bits_.astype(np.uint8).view(np.int8)
   else: v = bits_.view(src_t) if np.dtype(src_t).itemsize == bits_.dtype.itemsize else bits_.astype(src_t)
   out_t = LOAD_T[dt]
-  if np.dtype(out_t).kind in "iu" and v.dtype.kind == "f": v = np.trunc(v)
+  if np.dtype(out_t).kind in "iu" and v.dtype.kind == "f": v = np.rint(v) if rne else np.trunc(v)
   r = v.astype(out_t)
   return r.view(np.uint16) if np.dtype(out_t).itemsize == 2 else r.astype(np.uint16) if out_t == np.uint8 else r.view(np.uint32)
 
@@ -428,11 +465,12 @@ def _release_barrier(w:Wave, pc:np.ndarray, parked:np.ndarray):
   pc[parked] += 1
   parked[:] = False
 
-def run_wave(insts:list[Inst], w:Wave, budget:int=1 << 24):
+def run_wave(insts:list[Inst], w:Wave, budget:int=1 << 24, entry:int=0):
   # every lane has its own pc. Run the lowest pending pc for exactly the runnable lanes sitting there: divergent branches, loops with per
   # lane trip counts and predication all fall out. A lane reaching a barrier parks. Once nothing can run, each workgroup is released
   # together from the barrier instance all its lanes reached, so no lane passes a barrier (e.g. the next loop iteration's) early.
-  pc, alive, parked, steps = np.zeros(w.n, np.int64), np.ones(w.n, bool), np.zeros(w.n, bool), 0
+  pc, alive, parked, steps = np.full(w.n, entry, np.int64), np.ones(w.n, bool), np.zeros(w.n, bool), 0
+  ret_pc, depth = np.zeros((w.n, 16), np.int64), np.zeros(w.n, np.int64)  # call stack per lane
   with np.errstate(all="ignore"):
     while alive.any():
       if not (run := alive & ~parked).any():
@@ -453,6 +491,19 @@ def run_wave(insts:list[Inst], w:Wave, budget:int=1 << 24):
           alive &= ~sel
           continue
         elif n == "jump": nxt = p + i.immed
+        # qualcomm's cl compiler puts a function like sin before the kernel, calls it with call #rel and returns with ret, and
+        # SP_CS_PROGRAM_COUNTER_OFFSET says where the kernel starts
+        elif n == "call":
+          lanes = np.nonzero(sel)[0]
+          if (depth[lanes] == ret_pc.shape[1]).any(): raise EmuError(f"call stack deeper than {ret_pc.shape[1]}")
+          ret_pc[lanes, depth[lanes]], depth[lanes] = p + 1, depth[lanes] + 1
+          nxt = p + i.immed
+        elif n == "ret":
+          lanes = np.nonzero(sel)[0]
+          if (depth[lanes] == 0).any(): raise EmuError("ret with nothing to return to")
+          depth[lanes] -= 1
+          pc[lanes] = ret_pc[lanes, depth[lanes]]
+          continue
         elif n in ("br", "brao", "braa"):
           c1 = (w.reg[REG_P0 + i.extra["comp1"]] != 0) ^ bool(i.extra["inv1"])
           c2 = (w.reg[REG_P0 + i.extra["comp2"]] != 0) ^ bool(i.extra["inv2"])
@@ -470,9 +521,11 @@ def run_wave(insts:list[Inst], w:Wave, budget:int=1 << 24):
           for dst, v in zip((i.extra["dst0"], i.extra["dst1"]), vals): w.write_bits(dst, i.dst_half, v)
         else:
           st, dt = TYPES[i.raw["SRC_TYPE"]], TYPES[i.raw["DST_TYPE"]]
-          if i.extra["round"]: raise EmuError(f"{n}: rounding mode {i.extra['round']}")
-          s, dst = i.srcs[0], unwrap(i.dst)
-          outs = [_convert(_typed_imm(s.val, st, w.n) if s.kind == "imm" else w.read_bits(s, k), st, dt) for k in range(i.repeat + 1)]
+          # ir3-cat1.xml #round: 0 is mesa's default, 1 (even) is round to nearest even, what mesa sets for rtne conversions and what
+          # qualcomm's cl compiler sets for (float)int. numpy already rounds int->float that way, so only float->int changes
+          if i.extra["round"] > 1: raise EmuError(f"{n}: rounding mode {i.extra['round']}")
+          s, dst, rne = i.srcs[0], unwrap(i.dst), i.extra["round"] == 1
+          outs = [_convert(_typed_imm(s.val, st, w.n) if s.kind == "imm" else w.read_bits(s, k), st, dt, rne) for k in range(i.repeat + 1)]
           for k, v in enumerate(outs):
             if i.extra.get("dst_rel"): w.write_rel(dst + k, i.dst_half, v)
             else: w.write_bits(dst + k, i.dst_half, v)
@@ -491,19 +544,27 @@ def run_wave(insts:list[Inst], w:Wave, budget:int=1 << 24):
 RAW_T = {1: np.uint8, 2: np.uint16, 4: np.uint32}
 
 def _memory(i:Inst, w:Wave):
-  # memory holds raw bits: the type only picks the element width (u8 and 16 bit types go to/from half registers)
+  # memory holds raw bits: the type only picks the element width (8 and 16 bit types go to/from half registers).
+  # u8_32 is a signed byte: qualcomm's cl compiler loads a char with ldg.u8_32 r0.y and reads it back as cov.s16s32 hr0.y, and stores a byte
+  # with stg.u8_32 g[r0.x], r0.x where the full r0.x is the address, so the register is the half one of the same number
   t, size, off = i.extra["type"], i.extra["size"], i.extra["off"]
-  if (np_t := LOAD_T.get(t)) is None: raise EmuError(f"{i.name}.{t} not supported")
+  if t == "u8_32" and w.merged: raise EmuError(f"{i.name}.u8_32 with merged registers")
+  if (np_t := np.int8 if t == "u8_32" else LOAD_T.get(t)) is None: raise EmuError(f"{i.name}.{t} not supported")
   width = np.dtype(np_t).itemsize
   half, raw, nbytes = width < 4, RAW_T[width], width * size
   regt = np.uint16 if half else np.uint32
   lanes = np.nonzero(w.mask())[0]
   if len(lanes) == 0: return
-  load = i.name in ("ldg", "ldl", "ldp")
-  if i.name in ("ldg", "stg"):
-    if off: raise EmuError(f"{i.name} with offset {off}")
+  load = i.name.startswith("ld")
+  if i.name.endswith(".a"):
+    # ir3-cat6.xml ldg.a: the offset is in units of the type and everything is zero extended to 64 bits, so nothing wraps at 32 bits
+    reg_off = w.reg[i.srcs[-1].val][lanes].astype(np.uint64)
+    off_bytes = ((reg_off << np.uint64(i.extra["shift"])) + np.uint64(off)) << np.uint64({4: 2, 2: 1, 1: 0}[width])
+  if i.name.startswith(("ldg", "stg")):
     lo = i.srcs[0].val  # 64 bit address in two scalars
     ptr = (w.reg[lo].astype(np.uint64) | (w.reg[lo + 1].astype(np.uint64) << np.uint64(32)))[lanes]
+    # the immediate offset is in bytes: mesa's emit_intrinsic_load_global_ir3 multiplies nir's dword offset by 4 to fill it
+    ptr = ptr + off_bytes if i.name.endswith(".a") else ptr + np.uint64(off & 0xffffffffffffffff)
     if load: data = w.mem.load(ptr, nbytes)
     else: w.mem.store(ptr, _gather_srcs(i, w, lanes, size, half, raw))
   else:
@@ -522,7 +583,7 @@ def _memory(i:Inst, w:Wave):
       if load: data = w.priv[lanes[:, None], idx]
       else: w.priv[lanes[:, None], idx] = _gather_srcs(i, w, lanes, size, half, raw)
   if load:
-    vals = np.ascontiguousarray(data).reshape(len(lanes), nbytes).view(raw).reshape(len(lanes), size)
+    vals = np.ascontiguousarray(data).reshape(len(lanes), nbytes).view(np.int8 if t == "u8_32" else raw).reshape(len(lanes), size)
     for k in range(size):
       v = np.zeros(w.n, regt)
       v[lanes] = vals[:, k].astype(regt)
@@ -632,7 +693,7 @@ class HostMemory:
 
 _decode_cache: dict[bytes, list[Inst]] = {}
 def dispatch(image:bytes, consts:bytes, groups:tuple[int, ...], local_size:tuple[int, ...], lid_reg:int, wgid_reg:int, merged:bool,
-             ranges:dict[int, int], images:tuple[int, int]=(0, 0)):
+             ranges:dict[int, int], images:tuple[int, int]=(0, 0), entry:int=0, demote:bool=True):
   if (insts := _decode_cache.get(image)) is None: insts = _decode_cache[image] = decode(image)
   c = np.frombuffer(consts, np.uint32)
   lanes = local_size[0] * local_size[1] * local_size[2]
@@ -646,9 +707,9 @@ def dispatch(image:bytes, consts:bytes, groups:tuple[int, ...], local_size:tuple
   for start in range(0, len(gids), per_wave):
     chunk = gids[start:start + per_wave]
     w = Wave(lanes * len(chunk), c, mem, np.repeat(np.arange(len(chunk)), lanes), merged)
-    w.images = images
+    w.images, w.demote = images, demote
     if lid_reg != 0xfc:
       for k in range(3): w.reg[lid_reg + k] = np.tile(lid[k], len(chunk))
     if wgid_reg != 0xfc:
       for k in range(3): w.reg[wgid_reg + k] = np.repeat(np.array([g[k] for g in chunk], np.uint32), lanes)
-    run_wave(insts, w)
+    run_wave(insts, w, entry=entry)
