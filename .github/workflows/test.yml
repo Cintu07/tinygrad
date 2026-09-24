@@ -644,13 +644,17 @@ jobs:
         uses: ./.github/actions/process-replay
 
   testqualcomm:
-    name: Linux (qcom a630 emulator)
+    strategy:
+      fail-fast: false
+      matrix:
+        renderer: [IR3, CL]
+    name: Linux (qcom a630 emulator, ${{ matrix.renderer }})
     runs-on: ${{ github.repository == 'tinygrad/tinygrad' && github.event_name == 'pull_request' && github.event.pull_request.author_association == 'COLLABORATOR' && 'namespace-profile-tinygrad' || 'ubuntu-24.04' }}
     timeout-minutes: 20
     env:
       FORWARD_ONLY: 1
       SKIP_SLOW_TEST: 1
-      DEV: MOCK+QCOM:IR3
+      DEV: MOCK+QCOM:${{ matrix.renderer }}
       HCQ_RUNTIME_DEV: CPU
     steps:
       - name: Checkout Code
@@ -658,14 +662,15 @@ jobs:
       - name: Setup Environment
         uses: ./.github/actions/setup-tinygrad
         with:
-          key: qcom-minimal
+          key: qcom-${{ matrix.renderer }}
           deps: "testing_unit mesa"
+          qemu: ${{ matrix.renderer == 'CL' }}
       - name: Check Device.DEFAULT
         run: python3 -c "from tinygrad import Device; assert Device.DEFAULT == 'QCOM', Device.DEFAULT"
       - name: Run emulator instruction tests
         run: python -m pytest -n=auto test/qcom/
       - name: Run pytest (qcom)
-        run: python -m pytest -n=auto test/backend --ignore test/backend/test_multitensor.py --durations=20
+        run: python -m pytest -n=auto ${{ matrix.renderer == 'CL' && 'test/backend/test_ops.py' || 'test/backend --ignore test/backend/test_multitensor.py' }} --durations=20
 
 # ****** Compile-only Tests ******
 
