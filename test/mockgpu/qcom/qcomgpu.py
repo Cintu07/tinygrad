@@ -34,9 +34,8 @@ class QCOMGPU(VirtGPU):
       elif (fxn := getattr(self, f"_{CP_NAMES[op].lower()}", None) if op in CP_NAMES else None) is not None: fxn(payload)
       else: raise NotImplementedError(f"PM4 opcode {op:#x} with {len(payload)} words")
 
-  def _cp_set_marker(self, p:list[int]): pass
-  def _cp_wait_for_idle(self, p:list[int]): pass
-  def _cp_wait_mem_writes(self, p:list[int]): pass
+  def _cp_set_marker(self, p:list[int]): pass  # packets run in order at submit, markers and waits have nothing to do
+  _cp_wait_for_idle = _cp_wait_mem_writes = _cp_set_marker
 
   def _cp_event_write(self, p:list[int]):
     if len(p) == 4:  # CACHE_FLUSH_TS writes the value to the address, tinygrad uses it as the done signal

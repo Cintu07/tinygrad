@@ -52,12 +52,10 @@ class Inst:
   dst_half: bool = False
   srcs: list[Src] = field(default_factory=list)
   repeat: int = 0
-  nop: int = 0
   sat: bool = False
   cond: str|None = None
   immed: int = 0
   extra: dict = field(default_factory=dict)
-  raw: dict = field(default_factory=dict)  # fields named like mesa's isaspec, used to cross check against mesa's decoder
 
 def _half_type(t:int) -> bool: return t in (0, 2, 4, 6, 7)  # f16, u16, s16, u8, u8_32 live in half registers
 
@@ -80,28 +78,24 @@ def _cat3src(v:int, full:bool, r:bool, neg:bool, immed_encoding:bool) -> Src:
 def decode_one(pc:int, w:int) -> Inst:
   cat = bits(w, 61, 63)
   i = Inst(pc, w, cat, "?")
-  i.raw.update(JP=bits(w, 59, 59), SY=bits(w, 60, 60))
   if cat == 0:
-    i.immed, i.raw["IMMED"] = sext(bits(w, 0, 31), 32), sext(bits(w, 0, 31), 32)
+    i.immed = sext(bits(w, 0, 31), 32)
     opc, hi = bits(w, 55, 58), bits(w, 49, 49)
     if not hi and opc == 1:
       i.name = CAT0_BR.get(bits(w, 37, 39), f"cat0.br{bits(w, 37, 39)}")
       i.extra.update(inv1=bits(w, 52, 52), comp1=bits(w, 53, 54), inv2=bits(w, 45, 45), comp2=bits(w, 46, 47))
-      i.raw.update(INV1=i.extra["inv1"], COMP1=i.extra["comp1"])
-      if i.name in ("brao", "braa"): i.raw.update(INV2=i.extra["inv2"], COMP2=i.extra["comp2"])
     else:
       i.name = (CAT0_HI if hi else CAT0_LO).get(opc, f"cat0.{hi}.{opc}")
       i.repeat = bits(w, 40, 42)
   elif cat == 1:
     opc, form = bits(w, 57, 58), bits(w, 53, 54)
     st, dt = bits(w, 50, 52), bits(w, 46, 48)
-    i.raw.update(SRC_TYPE=st, DST_TYPE=dt)
+    i.extra.update(st=TYPES[st], dt=TYPES[dt])
     if opc == 0b10 and bits(w, 24, 31) == 0:
       i.name = f"swz.{TYPES[st]}{TYPES[dt]}"
       i.extra.update(dst0=bits(w, 32, 39), dst1=bits(w, 16, 23))
       i.srcs = [Src("r", bits(w, 0, 7), _half_type(st)), Src("r", bits(w, 8, 15), _half_type(st))]
       i.dst_half = _half_type(dt)
-      i.raw.update(DST0=i.extra["dst0"], DST1=i.extra["dst1"], SRC0=bits(w, 0, 7), SRC1=bits(w, 8, 15))
     elif opc == 0:
       i.name = f"{'mov' if st == dt else 'cov'}.{TYPES[st]}{TYPES[dt]}"
       # a relative dst (bit 49) or src (bit 11) is a register array store/load (ir3_create_array_store/load) at a0.x + offset,
@@ -116,7 +110,6 @@ def decode_one(pc:int, w:int) -> Inst:
         if form not in (0b00, 0b01, 0b10): raise NotImplementedError(f"cat1 form {form}")
         kind, hi = {0b10: ("imm", 31), 0b01: ("c", 10), 0b00: ("r", 7)}[form]
         i.srcs = [Src(kind, bits(w, 0, hi), _half_type(st), 0, r and kind != "imm")]
-      i.raw.update(DST=i.dst, SRC=bits(w, 0, hi), REPEAT=i.repeat)
     else: raise NotImplementedError(f"cat1 opc {opc}")
   elif cat == 2:
     i.name = CAT2.get(bits(w, 53, 58), f"cat2.{bits(w, 53, 58)}")
@@ -124,11 +117,10 @@ def decode_one(pc:int, w:int) -> Inst:
     i.dst, i.sat = bits(w, 32, 39), bool(bits(w, 42, 42))
     i.dst_half = full == conv and i.dst <= 0xf7
     r1, r2, rpt = bool(bits(w, 43, 43)), bool(bits(w, 51, 51)), bits(w, 40, 41)
-    if (r1 or r2) and rpt == 0: i.nop, r1, r2 = int(r1) | int(r2) << 1, False, False
+    if rpt == 0: r1 = r2 = False  # without (rptN) these bits are (nopN)
     i.repeat = rpt
     i.srcs = [_multisrc(bits(w, 0, 15), full, r1)] + ([] if i.name in CAT2_1SRC else [_multisrc(bits(w, 16, 31), full, r2)])
-    if i.name.startswith(("cmps", "cmpv")): i.cond, i.raw["COND"] = CONDS[bits(w, 48, 50)], bits(w, 48, 50)
-    i.raw.update(DST=i.dst, SRC1=bits(w, 0, 15), **({} if i.name in CAT2_1SRC else {"SRC2": bits(w, 16, 31)}))
+    if i.name.startswith(("cmps", "cmpv")): i.cond = CONDS[bits(w, 48, 50)]
   elif cat == 3:
     alt, opc = bool(bits(w, 13, 13)), bits(w, 55, 58)
     if alt:
@@ -141,18 +133,16 @@ def decode_one(pc:int, w:int) -> Inst:
     i.dst = bits(w, 32, 39)
     i.dst_half = full == conv and i.dst <= 0xf7
     r1, r2, r3, rpt = bool(bits(w, 43, 43)), bool(bits(w, 15, 15)), bool(bits(w, 29, 29)), bits(w, 40, 41)
-    if (r1 or r2) and rpt == 0: i.nop, r1, r2 = int(r1) | int(r2) << 1, False, False
+    if rpt == 0: r1 = r2 = False  # without (rptN) these bits are (nopN)
     i.repeat = rpt
     i.srcs = [_cat3src(bits(w, 0, 12), full, r1, bool(bits(w, 14, 14)), alt), Src("r", bits(w, 47, 54), not full, bits(w, 30, 30), r2),
               _cat3src(bits(w, 16, 28), full, r3, bool(bits(w, 31, 31)), alt)]
-    i.raw.update(DST=i.dst, SRC1=bits(w, 0, 12), SRC2=bits(w, 47, 54), SRC3=bits(w, 16, 28))
   elif cat == 4:
     i.name = CAT4.get(bits(w, 53, 58), f"cat4.{bits(w, 53, 58)}")
     full, conv = bool(bits(w, 52, 52)), bool(bits(w, 46, 46))
     i.dst, i.sat, i.repeat = bits(w, 32, 39), bool(bits(w, 42, 42)), bits(w, 40, 41)
     i.dst_half = full == conv and i.dst <= 0xf7
     i.srcs = [_multisrc(bits(w, 0, 15), full, bool(bits(w, 43, 43)))]
-    i.raw.update(DST=i.dst, SRC=bits(w, 0, 15), REPEAT=i.repeat)
   elif cat == 6 and bits(w, 52, 53) == 0b10:  # a6xx image/ssbo encoding (ir3-cat6.xml #instruction-cat6-a6xx-ibo-load-store)
     sub, t = bits(w, 14, 19), bits(w, 49, 51)
     if sub != 0b011101: raise NotImplementedError(f"cat6 a6xx ibo opc {sub:06b}")  # only stib.b, tinygrad loads images with isam
@@ -160,50 +150,39 @@ def decode_one(pc:int, w:int) -> Inst:
     i.name = "stib.b"
     i.extra.update(type=TYPES[t], type_half=_half_type(t), ibo=bits(w, 41, 48), d=bits(w, 9, 10) + 1, size=bits(w, 12, 13) + 1)
     i.srcs = [Src("r", bits(w, 32, 39), _half_type(t)), Src("r", bits(w, 24, 31))]  # value, coordinates
-    i.raw.update(SRC1=bits(w, 32, 39), SRC2=bits(w, 24, 31), SSBO=bits(w, 41, 48), TYPE=t, TYPED=bits(w, 11, 11))
   elif cat == 6:
     opc, t = bits(w, 54, 58), bits(w, 49, 51)
     i.name = CAT6.get(opc, f"cat6.{opc}")
     i.extra.update(type=TYPES[t], type_half=t in (0, 2, 4, 6))
-    i.raw["TYPE"] = t
     if opc in ATOMICS:  # ir3-cat6.xml #instruction-cat6-a3xx-atomic, bit 52 is global (.g) or local (.l)
       if bits(w, 22, 23): raise NotImplementedError("atomic with an immediate source")
       i.name = f"atomic.{'g.' if bits(w, 52, 52) else ''}{ATOMICS[opc]}"
       i.dst, i.srcs = bits(w, 32, 39), [Src("r", bits(w, 14, 21)), Src("r", bits(w, 24, 31))]  # address, value
-      i.raw.update(DST=i.dst, SRC1=bits(w, 14, 21), SRC2=bits(w, 24, 31))
     elif i.name == "ldg" and bits(w, 22, 22):  # ldg.a: g[src1 + (((src2 << SRC2_SHIFT) + OFF) << TYPE_SHIFT)]
       i.name, i.dst, i.extra["size"] = "ldg.a", bits(w, 32, 39), bits(w, 24, 26)
       i.extra.update(off=bits(w, 9, 10), shift=bits(w, 12, 13))
       i.srcs = [Src("r", bits(w, 14, 21)), Src("r", bits(w, 1, 8))]
-      i.raw.update(DST=i.dst, SRC1=bits(w, 14, 21), SRC2=bits(w, 1, 8), OFF=i.extra["off"], SRC2_SHIFT=i.extra["shift"], SIZE=i.extra["size"])
     elif i.name == "ldg":
       i.dst, i.extra["off"], i.extra["size"] = bits(w, 32, 39), sext(bits(w, 1, 13), 13), bits(w, 24, 26)
       i.srcs = [Src("r", bits(w, 14, 21))]
-      i.raw.update(DST=i.dst, SRC1=bits(w, 14, 21), OFF=i.extra["off"], SIZE=i.extra["size"])
     elif i.name == "stg" and bits(w, 52, 52):  # stg.a, addressed like ldg.a
       i.name, i.extra["size"] = "stg.a", bits(w, 24, 26)
       i.extra.update(off=bits(w, 9, 10), shift=bits(w, 12, 13))
       i.srcs = [Src("r", bits(w, 41, 48)), Src("r", bits(w, 1, 8), i.extra["type_half"]), Src("r", bits(w, 32, 39))]  # address, value, offset
-      i.raw.update(SRC1=bits(w, 41, 48), SRC2=bits(w, 32, 39), SRC3=bits(w, 1, 8), OFF=i.extra["off"], SRC2_SHIFT=i.extra["shift"],
-                   SIZE=i.extra["size"])
     elif i.name == "stg":
       i.extra["off"] = sext(bits(w, 9, 13) << 8 | bits(w, 32, 39), 13)
       i.extra["size"] = bits(w, 24, 26)
       i.srcs = [Src("r", bits(w, 41, 48)), Src("r", bits(w, 1, 8), i.extra["type_half"])]  # address, value
-      i.raw.update(SRC1=bits(w, 41, 48), SRC3=bits(w, 1, 8), OFF=i.extra["off"], SIZE=i.extra["size"])
     elif i.name in ("ldl", "ldp"):
       i.dst, i.extra["off"], i.extra["size"] = bits(w, 32, 39), sext(bits(w, 1, 13), 13), bits(w, 24, 31)
       i.srcs = [Src("r", bits(w, 14, 21))]
-      i.raw.update(DST=i.dst, SRC=bits(w, 14, 21), OFF=i.extra["off"], SIZE=i.extra["size"])
     elif i.name in ("stl", "stp"):
       i.extra["off"] = sext(bits(w, 9, 13) << 8 | bits(w, 32, 39), 13)
       i.extra["size"] = bits(w, 24, 31)
       i.srcs = [Src("r", bits(w, 41, 48)), Src("r", bits(w, 1, 8), i.extra["type_half"])]  # address, value
-      i.raw.update(DST=bits(w, 41, 48), SRC=bits(w, 1, 8), OFF=i.extra["off"], SIZE=i.extra["size"])
   elif cat == 7:
     opc = bits(w, 55, 58)
     i.name = {0: "bar", 1: "fence"}.get(opc, f"cat7.{opc}")
-    if opc in (0, 1): i.raw.update(W=bits(w, 51, 51), R=bits(w, 52, 52), L=bits(w, 53, 53), G=bits(w, 54, 54))
   elif cat == 5:  # ir3-cat5.xml #instruction-cat5, tinygrad only emits isam (integer texel fetch) for image loads
     if (opc := bits(w, 54, 58)) != 0: raise NotImplementedError(f"cat5 opc {opc}")
     if bits(w, 51, 51): raise NotImplementedError("isam s2en/bindless")
@@ -211,7 +190,6 @@ def decode_one(pc:int, w:int) -> Inst:
     i.name, i.dst, i.dst_half = "isam", bits(w, 32, 39), _half_type(t)
     i.extra.update(type=TYPES[t], wrmask=bits(w, 40, 43), tex=bits(w, 25, 31), samp=bits(w, 21, 24))
     i.srcs = [Src("r", bits(w, 1, 8), not bits(w, 0, 0))]  # coordinates
-    i.raw.update(DST=i.dst, SRC1=bits(w, 1, 8), TEX=i.extra["tex"], SAMP=i.extra["samp"], TYPE=t, WRMASK=i.extra["wrmask"])
   else:
     i.name = f"cat{cat}"
   return i
@@ -428,7 +406,6 @@ def _alu(i:Inst, w:Wave, off:int) -> np.ndarray:
   elif i.sat: r = np.clip(r, 0, 1)
   r = np.asarray(r)
   if i.cat in (2, 3, 4) and i.dst_half != half:  # DST_CONV: the result is written with the other precision
-    r = np.asarray(r)
     if r.dtype.kind == "f": return r.astype(np.float16 if i.dst_half else np.float32).view(np.uint16 if i.dst_half else np.uint32)
     if i.dst_half: return r.astype(np.uint32).astype(np.uint16)                                # narrowing keeps the low bits
     return r.astype(np.int32 if k == "s" else np.uint32).view(np.uint32)                       # widening extends by signedness
@@ -448,10 +425,6 @@ def _convert(bits_:np.ndarray, st:str, dt:str, rne:bool=False) -> np.ndarray:
   if np.dtype(out_t).kind in "iu" and v.dtype.kind == "f": v = np.rint(v) if rne else np.trunc(v)
   r = v.astype(out_t)
   return r.view(np.uint16) if np.dtype(out_t).itemsize == 2 else r.astype(np.uint16) if out_t == np.uint8 else r.view(np.uint32)
-
-def _typed_imm(val:int, st:str, n:int) -> np.ndarray:
-  if st in ("f32", "u32", "s32"): return np.full(n, val & 0xffffffff, np.uint32)
-  return np.full(n, val & 0xffff, np.uint16)
 
 def _release_barrier(w:Wave, pc:np.ndarray, parked:np.ndarray):
   # nothing can run: every lane still executing is parked at a barrier. a lane that already hit `end` can never arrive and the hardware does not
@@ -515,17 +488,16 @@ def run_wave(insts:list[Inst], w:Wave, budget:int=1 << 24, entry:int=0):
         elif n == "prede": w.pred_mode[sel] = 0
         else: raise EmuError(f"cat0 {n} not implemented")
       elif i.cat == 1:
+        st, dt = i.extra["st"], i.extra["dt"]
         if n.startswith("swz"):
-          st, dt = TYPES[i.raw["SRC_TYPE"]], TYPES[i.raw["DST_TYPE"]]
           vals = [_convert(w.read_bits(s), st, dt) for s in i.srcs]
           for dst, v in zip((i.extra["dst0"], i.extra["dst1"]), vals): w.write_bits(dst, i.dst_half, v)
         else:
-          st, dt = TYPES[i.raw["SRC_TYPE"]], TYPES[i.raw["DST_TYPE"]]
           # ir3-cat1.xml #round: 0 is mesa's default, 1 (even) is round to nearest even, what mesa sets for rtne conversions and what
           # qualcomm's cl compiler sets for (float)int. numpy already rounds int->float that way, so only float->int changes
           if i.extra["round"] > 1: raise EmuError(f"{n}: rounding mode {i.extra['round']}")
           s, dst, rne = i.srcs[0], unwrap(i.dst), i.extra["round"] == 1
-          outs = [_convert(_typed_imm(s.val, st, w.n) if s.kind == "imm" else w.read_bits(s, k), st, dt, rne) for k in range(i.repeat + 1)]
+          outs = [_convert(w.read_bits(s, k), st, dt, rne) for k in range(i.repeat + 1)]
           for k, v in enumerate(outs):
             if i.extra.get("dst_rel"): w.write_rel(dst + k, i.dst_half, v)
             else: w.write_bits(dst + k, i.dst_half, v)
