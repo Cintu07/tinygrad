@@ -156,6 +156,11 @@ class TestQCOMEmu(unittest.TestCase):
             regs={5: a, 3: b})
     np.testing.assert_equal(w.reg[7], (a * b) & 0xffffffff)
 
+  def test_add_u_ei_keeps_carry(self):
+    # qualcomm's int64 multiply adds its middle partial products with this and shifts by 15 for bits 16-32, so the carry can't be lost
+    w = run(0x4210800500090008, "add.u (ei)r1.y, r2.x, r2.y", regs={8: [0xffffffff, 0xffff, 3, 0x80000000], 9: [1, 0, 4, 0x80000000]})
+    np.testing.assert_equal(w.reg[5], [0x80000000, 0x7fff, 3, 0x80000000])
+
   def test_sad_s32_address_high_word(self):
     # taken from qualcomm's cl compiler output (DEV=QCOM): the high word of base + off, with the sign bit of off negated and the carry added
     w = run(0x6781080140011055, "(nop1) sad.s32 r0.y, c21.y, (neg)r0.z, r0.y", regs={2: [0, 1, 0, 1], 1: [0, 0, 1, 1]}, consts=c32(c85=0x1000))

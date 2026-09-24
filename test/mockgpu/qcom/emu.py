@@ -121,6 +121,7 @@ def decode_one(pc:int, w:int) -> Inst:
     i.repeat = rpt
     i.srcs = [_multisrc(bits(w, 0, 15), full, r1)] + ([] if i.name in CAT2_1SRC else [_multisrc(bits(w, 16, 31), full, r2)])
     if i.name.startswith(("cmps", "cmpv")): i.cond = CONDS[bits(w, 48, 50)]
+    i.extra["ei"] = bool(bits(w, 47, 47))
   elif cat == 3:
     alt, opc = bool(bits(w, 13, 13)), bits(w, 55, 58)
     if alt:
@@ -327,6 +328,11 @@ def _alu(i:Inst, w:Wave, off:int) -> np.ndarray:
   n, a = i.name, vals[0]
   b, c = vals[1] if len(vals) > 1 else a, vals[2] if len(vals) > 2 else a  # one and two source ops never read the missing operands
   sh = 15 if half else 31
+  # (ei) keeps the carry: the 33 bit sum shifted right by one. qualcomm's cl compiler adds the middle partial products of a 64 bit multiply
+  # with add.u (ei) and takes bits 16-32 of the sum with shr.b 15, which only gives int64 1 * -1 = -1 this way
+  if i.extra.get("ei"):
+    if n != "add.u": raise EmuError(f"(ei){n} not supported")
+    return ((a.astype(np.uint64) + b.astype(np.uint64)) >> np.uint64(1)).astype(ut)
   if n in ("add.f", "add.u", "add.s"): r = a + b
   elif n in ("sub.u", "sub.s"): r = a - b
   elif n == "mul.f": r = a * b
