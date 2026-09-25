@@ -100,6 +100,7 @@ class IR3Compiler(Compiler):
     self.cc = mesa.ir3_compiler_create(None, self.dev_id, mesa.fd_dev_info(self.dev_id),
                                        mesa.struct_ir3_compiler_options(disable_cache=True)).contents
     self.cc.has_preamble = False
+    self.cc.mergedregs = False
     self.nir_options = bytes(mesa.ir3_get_compiler_options(self.cc).contents)
     super().__init__(f"compile_ir3_{arch}")
 
