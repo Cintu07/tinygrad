@@ -156,10 +156,13 @@ class TestQCOMEmu(unittest.TestCase):
             regs={5: a, 3: b})
     np.testing.assert_equal(w.reg[7], (a * b) & 0xffffffff)
 
-  def test_add_u_ei_keeps_carry(self):
-    # qualcomm's int64 multiply adds its middle partial products with this and shifts by 15 for bits 16-32, so the carry can't be lost
+  def test_add_ei_is_halving_add(self):
+    # mesa emits nir uhadd as add.u (ei) and ihadd as add.s (ei): (a + b) >> 1 without losing the carry. the add.u word is from qualcomm's
+    # int64 multiply, the add.s one is it with the opcode (bits 53-58) set to add.s
     w = run(0x4210800500090008, "add.u (ei)r1.y, r2.x, r2.y", regs={8: [0xffffffff, 0xffff, 3, 0x80000000], 9: [1, 0, 4, 0x80000000]})
     np.testing.assert_equal(w.reg[5], [0x80000000, 0x7fff, 3, 0x80000000])
+    w = run(0x4230800500090008, "add.s (ei)r1.y, r2.x, r2.y", regs={8: [-3, -3, 0x7fffffff, -2**31], 9: [4, -4, 1, -1]})
+    np.testing.assert_equal(w.reg[5].view(np.int32), [0, -4, 2**30, -2**30 - 1])
 
   def test_sad_s32_address_high_word(self):
     # taken from qualcomm's cl compiler output (DEV=QCOM): the high word of base + off, with the sign bit of off negated and the carry added

@@ -328,11 +328,11 @@ def _alu(i:Inst, w:Wave, off:int) -> np.ndarray:
   n, a = i.name, vals[0]
   b, c = vals[1] if len(vals) > 1 else a, vals[2] if len(vals) > 2 else a  # one and two source ops never read the missing operands
   sh = 15 if half else 31
-  # (ei) keeps the carry: the 33 bit sum shifted right by one. qualcomm's cl compiler adds the middle partial products of a 64 bit multiply
-  # with add.u (ei) and takes bits 16-32 of the sum with shr.b 15, which only gives int64 1 * -1 = -1 this way
+  # (ei) on an add is a halving add, (a + b) >> 1 without losing the carry: mesa emits nir uhadd as add.u (ei) and ihadd as add.s (ei)
+  # (ir3_compiler_nir.c), and qualcomm's cl compiler builds its int64 multiply out of it
   if i.extra.get("ei"):
-    if n != "add.u": raise EmuError(f"(ei){n} not supported")
-    return ((a.astype(np.uint64) + b.astype(np.uint64)) >> np.uint64(1)).astype(ut)
+    if n not in ("add.u", "add.s"): raise EmuError(f"(ei){n} not supported")
+    return ((a.astype(np.int64) + b.astype(np.int64)) >> 1).astype(ut)
   if n in ("add.f", "add.u", "add.s"): r = a + b
   elif n in ("sub.u", "sub.s"): r = a - b
   elif n == "mul.f": r = a * b
