@@ -232,8 +232,8 @@ class Wave:
   def mask(self) -> np.ndarray: return self.m  # set by run_wave once per step
 
   def update_mask(self):
-    blocked = ((self.pred_mode == 1) & ~self.pred_mask) | ((self.pred_mode == 2) & self.pred_mask)
-    self.m = self.active & ~blocked
+    if not self.pred_mode.any(): self.m = self.active  # nothing predicated, the common case
+    else: self.m = self.active & ~(((self.pred_mode == 1) & ~self.pred_mask) | ((self.pred_mode == 2) & self.pred_mask))
 
   # raw bit patterns: uint32 vectors for full values, uint16 vectors for half values
   # fl: a cat2/cat3 float opcode reads the source (only matters for half constants)
@@ -448,18 +448,22 @@ def run_wave(insts:list[Inst], w:Wave, budget:int=1 << 24, entry:int=0):
   # every lane has its own pc. Run the lowest pending pc for exactly the runnable lanes sitting there: divergent branches, loops with per
   # lane trip counts and predication all fall out. A lane reaching a barrier parks. Once nothing can run, each workgroup is released
   # together from the barrier instance all its lanes reached, so no lane passes a barrier (e.g. the next loop iteration's) early.
-  pc, alive, parked, steps = np.full(w.n, entry, np.int64), np.ones(w.n, bool), np.zeros(w.n, bool), 0
+  pc, alive, parked, steps, same, p = np.full(w.n, entry, np.int64), np.ones(w.n, bool), np.zeros(w.n, bool), 0, False, entry
   ret_pc, depth = np.zeros((w.n, 16), np.int64), np.zeros(w.n, np.int64)  # call stack per lane
   with np.errstate(all="ignore"):
-    while alive.any():
-      if not (run := alive & ~parked).any():
-        _release_barrier(w, pc, parked)
-        continue
-      p = int(pc[run].min())
+    while same or alive.any():
+      # same: every runnable lane ran the last instruction and it was no branch, end, barrier or pred change, so they all moved on to p + 1
+      # together and the lanes and the write mask are unchanged
+      if same: p, same = p + 1, False
+      else:
+        if not (run := alive & ~parked).any():
+          _release_barrier(w, pc, parked)
+          continue
+        p = int(pc[run].min())
+        sel = run & (pc == p)
+        w.active, all_run = sel, bool(sel.sum() == run.sum())
+        w.update_mask()
       if p >= len(insts): raise EmuError("fell off the end of the program")
-      sel = run & (pc == p)
-      w.active = sel
-      w.update_mask()
       i = insts[p]
       steps += 1
       if steps > budget: raise EmuError(f"instruction budget exceeded at pc {p} (gpu hang)")
@@ -518,6 +522,7 @@ def run_wave(insts:list[Inst], w:Wave, budget:int=1 << 24, entry:int=0):
       elif i.cat == 7 and n == "fence": pass  # every memory access is applied in program order, there is nothing to reorder
       else: raise EmuError(f"{n} (cat{i.cat}) not implemented")
       pc[sel] = nxt
+      same = all_run and nxt == p + 1 and (i.cat != 0 or n == "nop")
 
 RAW_T = {1: np.uint8, 2: np.uint16, 4: np.uint32}
 
