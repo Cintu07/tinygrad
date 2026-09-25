@@ -525,6 +525,7 @@ def _memory(i:Inst, w:Wave):
   # memory holds raw bits: the type only picks the element width (8 and 16 bit types go to/from half registers).
   # u8_32 is a signed byte: qualcomm's cl compiler loads a char with ldg.u8_32 r0.y and reads it back as cov.s16s32 hr0.y, and stores a byte
   # with stg.u8_32 g[r0.x], r0.x where the full r0.x is the address, so the register is the half one of the same number
+  if "size" not in i.extra: raise EmuError(f"{i.name} not implemented")  # a cat6 opcode the decoder has no layout for (ldc, ldib, ...)
   t, size, off = i.extra["type"], i.extra["size"], i.extra["off"]
   if t == "u8_32" and w.merged: raise EmuError(f"{i.name}.u8_32 with merged registers")
   if (np_t := np.int8 if t == "u8_32" else LOAD_T.get(t)) is None: raise EmuError(f"{i.name}.{t} not supported")

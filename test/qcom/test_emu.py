@@ -209,6 +209,23 @@ class TestQCOMEmu(unittest.TestCase):
             ("call #4", "call #3","add.s r0.w, r0.w, -8", "end", "(ss)add.s r0.w, r0.w, 8", "(sy)(ss)ret"), regs={3: [0, 1, 2, 3]})
     np.testing.assert_equal(w.reg[3], [8, 9, 10, 11])
 
+  # control flow: every lane has its own pc. words are mesa's (br, stl, ldl) or ones checked against its disassembler with one field changed
+  def test_divergent_branch_reconverges(self):
+    w = run((0x42b400f820010004, 0x0080000000000003, 0x4230000320080003, 0x0100000000000002, 0x4230000327f80003),
+            ("cmps.s.eq p0.x, r1.x, 1", "br p0.x, #3", "add.s r0.w, r0.w, 8", "jump #2", "add.s r0.w, r0.w, -8"), regs={4: [1, 0, 1, 5]})
+    np.testing.assert_equal(w.reg[3].view(np.int32), [-8, 8, -8, 8])
+
+  def test_loop_with_per_lane_trip_count(self):
+    w = run((0x4230000320080003, 0x42b000f800040003, 0x00800000fffffffe), ("add.s r0.w, r0.w, 8", "cmps.s.lt p0.x, r0.w, r1.x", "br p0.x, #-2"),
+            regs={4: [8, 24, 1, 40]})
+    np.testing.assert_equal(w.reg[3], [8, 24, 8, 40])
+
+  def test_barrier_local_memory_per_workgroup(self):
+    # two workgroups of two lanes: each lane stores, waits at bar, then reads the other lane's value from its own workgroup's l[]
+    w = run((0xc106050001800008, 0xe002000000000000, 0xc046000101804001), ("stl.u32 l[r0.z], r1.x, 1", "bar", "ldl.u32 r0.y, l[r0.y], 1"),
+            regs={2: [0, 4, 0, 4], 4: [10, 11, 20, 21], 1: [4, 0, 4, 0]}, group=[0, 0, 1, 1])
+    np.testing.assert_equal(w.reg[1], [11, 10, 21, 20])
+
   def test_fence(self):
     w = run(0xe0fa000000000000, "fence.g.l.r.w", regs={0: [1, 2, 3, 4]})
     np.testing.assert_equal(w.reg[0], [1, 2, 3, 4])
@@ -239,6 +256,11 @@ class TestQCOMEmu(unittest.TestCase):
     # the compare/value order of the register pair isn't confirmed, so the emulator raises instead of guessing
     with self.assertRaises(EmuError):
       self._global(0xc556000202000001, "atomic.g.cmpxchg.untyped.1d.u32.1.g r0.z, r0.x, r0.z", 0, [0]*4, np.uint32)
+
+  def test_unknown_memory_op_refuses(self):
+    # mesa's ldlw word: the decoder has no layout for it, so running it fails with a clear error instead of a KeyError
+    with self.assertRaisesRegex(EmuError, "not implemented"):
+      run(0xc286000302808011, "ldlw.u32 r0.w, l[r0.z+8], 2")
 
 if __name__ == "__main__":
   unittest.main()
