@@ -653,7 +653,7 @@ jobs:
       matrix:
         renderer: [IR3, CL]
     name: Linux (qcom a630 emulator, ${{ matrix.renderer }})
-    runs-on: ${{ github.repository == 'tinygrad/tinygrad' && github.event_name == 'pull_request' && github.event.pull_request.author_association == 'COLLABORATOR' && 'namespace-profile-tinygrad' || 'ubuntu-24.04' }}
+    runs-on: *linux
     timeout-minutes: 20
     env:
       FORWARD_ONLY: 1
@@ -671,11 +671,9 @@ jobs:
           qemu: ${{ matrix.renderer == 'CL' }}
       - name: Check Device.DEFAULT
         run: python3 -c "from tinygrad import Device; assert Device.DEFAULT == 'QCOM', Device.DEFAULT"
-      - name: Run emulator instruction tests
-        run: python -m pytest -n=auto test/qcom/
       - name: Run pytest (qcom)
         # like the compile-only QCOMCL job: CL compiles in qemu, too slow for parallel workers
-        run: ${{ matrix.renderer == 'CL' && 'PARALLEL=0' || '' }} python -m pytest -n=auto ${{ matrix.renderer == 'CL' && 'test/backend/test_ops.py' || 'test/backend --ignore test/backend/test_multitensor.py' }} --durations=20
+        run: ${{ matrix.renderer == 'CL' && 'PARALLEL=0' || '' }} python -m pytest -n=auto ${{ matrix.renderer == 'CL' && 'test/runtime/test_ops.py' || 'test/runtime --ignore test/runtime/test_multitensor.py' }} test/device/qcom --durations=20
 
 # ****** Compile-only Tests ******
 
