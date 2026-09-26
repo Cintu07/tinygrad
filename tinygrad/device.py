@@ -369,7 +369,6 @@ class TinyELF:
 
   @staticmethod
   def args(signature:tuple[tuple[str|None, int, DType, tuple], ...], bufs:Sequence, vals:Sequence) -> list:
-    # the launch arguments in the kernel's order
     args = (*bufs, *vals)
     return [args[i] for _,i,_,_ in signature]
 

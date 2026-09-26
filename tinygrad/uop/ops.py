@@ -1299,7 +1299,7 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   # one-line convenience for the single-output case: self is the value
   def call_with_output(self, *srcs:UOp, **kwargs) -> UOp: return UOp.call_with_outputs((self,), *srcs, **kwargs)[0]
   def custom_kernel(*srcs:UOp, fxn:Callable, grad_fxn:Callable|None=None) -> list[UOp]:
-    # a scalar input is a scalar param in its place. it keeps the Variable's name, the value binds to it by name
+    # a Variable input is a scalar param in its place, it keeps its name so the bound value finds it
     placeholders = [UOp(Ops.PARAM, arg=replace((s.src[0] if s.op is Ops.AFTER else s).arg, slot=i)) if s.is_bound_var or s.is_variable else
                     UOp.placeholder_like(s, slot=i) for i,s in enumerate(srcs)]
     kernel = fxn(*placeholders).call(*srcs, grad_fxn=grad_fxn)

@@ -130,7 +130,7 @@ def _resolve(b:UOp, inputs:tuple[UOp, ...]) -> UOp:
   if b.op is Ops.MSTACK: return b.replace(src=tuple(_resolve(x, inputs) for x in b.src))
   return inputs[b.arg.slot] if b.op is Ops.PARAM else b
 def resolve_params(call:UOp, inputs:tuple[UOp, ...], slots:Sequence[int]|None=None) -> list[UOp]:
-  # slots pick call inputs by position (a kernel's globals), bound scalars count. without slots it's every buffer
+  # slots are positions in the call (a kernel's globals), bound scalars count
   return [_resolve(b, inputs) for b in (get_call_arg_uops(call) if slots is None else [call.src[1+s] for s in slots])]
 
 def unwrap_multi(call:UOp, resolved:list[UOp]) -> Iterator[tuple[list[Buffer], dict[str, int]]]:
@@ -212,7 +212,6 @@ pm_flatten_linear = PatternMatcher([
 ])
 
 def _validate(call:UOp, sink:UOp) -> UOp:
-  # scalars keep their place so the kernel's slots index both halves
   params = call.src[1:]
   shadows = tuple(p if p.is_bound_var else
                   UOp.new_buffer(("CPU",)*len(p.device) if isinstance(p.device, tuple) else "CPU", prod(p.max_shape), p.dtype) for p in params)

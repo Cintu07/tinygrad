@@ -291,7 +291,6 @@ class CLikeArgsState(HCQArgsState[ProgramType]):
 
     if prefix is not None: self.buf.cpu_view().view(size=len(prefix) * 4, fmt='I')[:] = array.array('I', prefix)
 
-    # buffer addresses and vals in the kernel's order
     for a,(off,dt) in zip(TinyELF.args(prg.signature, [b.va_addr for b in bufs], vals), TinyELF.iter_sig(prg.signature, 0, len(bufs))):
       assert a is not None
       self.bind_sints_to_buf(a, buf=self.buf, fmt=dt.fmt, offset=len(prefix or []) * 4 + off)

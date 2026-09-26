@@ -240,7 +240,7 @@ class BatchCtx:
   def stamps(self, devs:tuple[str, ...], tag:int) -> tuple[int, ...]: return (st:=len(self.queues[devs[0]])+1+2*tag, st + 1) if self.profile else ()
 
 def _wait_ins(ctx:BatchCtx, call:UOp, device:str, queue:str, tag:int) -> list[UOp]:
-  # outs are slots: positions in the call, bound scalars count. the tracker gets the buffers only
+  # outs are positions in the call, the tracker only gets the buffers
   write, pos = get_call_outs_ins(call)[0], [k for k, s in enumerate(call.src[1:]) if not s.is_bound_var]
   bufs = [call.src[1+k] for k in pos]
   latest:dict[tuple[str, str], int] = {} # (producer device, queue) -> the latest submit tag to wait on, same-queue submits are fifo

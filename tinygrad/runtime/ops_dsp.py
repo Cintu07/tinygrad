@@ -32,7 +32,7 @@ class DSPRenderer(ClangRenderer):
     msrc += [f'{self._render_dtype(b[1][0].dtype) if b[1][0].addrspace == AddrSpace.ALU else "int"} sz_or_val_{i} = '
              f'*({self._render_dtype(b[1][0].dtype) if b[1][0].addrspace == AddrSpace.ALU else "int"}*)((char*)pra[0].buf.pv+{i*8});'
              for i,b in enumerate(bufs)]
-    # offsets and fds are per buffer, j counts the buffers among the args
+    # offsets and fds are per buffer, j counts the buffers
     gbufs = [i for i,b in enumerate(bufs) if b[1][0].addrspace == AddrSpace.GLOBAL]
     msrc += [f'int off{i} = ((int*)pra[1].buf.pv)[{j}];' for j,i in enumerate(gbufs)]
     msrc += [f'void *buf_{i} = HAP_mmap(0,sz_or_val_{i},3,0,pra[{j+3}].dma.fd,0)+off{i};' for j,i in enumerate(gbufs)]
@@ -65,7 +65,6 @@ class DSPProgram(Program['DSPDevice']):
 
     pra, fds, attrs, _ = rpc_prep_args(ins=[var_vals_mv:=memoryview(bytearray((len(bufs)+len(vals))*8)), off_mv:=memoryview(bytearray(len(bufs)*4))],
                                        outs=[timer:=memoryview(bytearray(8)).cast('Q')], in_fds=[b.share_info.fd for b in bufs])
-    # buffer sizes and vals in the kernel's order
     for i,(a,(_,j,dt,_)) in enumerate(zip(TinyELF.args(self.signature, bufs, vals), self.signature)):
       struct.pack_into('i' if j < len(bufs) else unwrap(dt.fmt), var_vals_mv, i*8, a.size if j < len(bufs) else a)
     off_mv.cast('I')[:] = array.array('I', tuple(b.offset for b in bufs))

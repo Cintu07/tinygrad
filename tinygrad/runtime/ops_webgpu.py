@@ -74,7 +74,6 @@ class WebGPUProgram(Program['WebGpuDevice']):
     def bgl_entry(n:int, ty:str):
       return webgpu.WGPUBindGroupLayoutEntry(binding=n, visibility=webgpu.WGPUShaderStage_Compute,
                                              buffer=webgpu.WGPUBufferBindingLayout(type=getattr(webgpu, f'WGPUBufferBindingType_{ty}')))
-    # binding 0 is INFINITY, then buffers (storage) and vals (uniform) in the kernel's order
     bind_entries = (webgpu.WGPUBindGroupLayoutEntry * (1+len(bufs)+len(vals)))(
       bgl_entry(0, 'Uniform'), *(bgl_entry(i+1, 'Uniform' if j >= len(bufs) else 'Storage') for i,(_,j,_,_) in enumerate(self.signature)))
 
