@@ -12,7 +12,7 @@ from tinygrad.renderer.nir import IR3Renderer
 from tinygrad.helpers import getenv, mv_address, round_up, ceildiv, prod, is_image_shape
 from tinygrad.helpers import next_power2, flatten, PROFILE, IMAGE
 from tinygrad.dtype import dtypes, AddrSpace
-from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, resolve
+from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher
 from tinygrad.engine.realize import get_call_arg_uops, get_call_var_uops
 from tinygrad.runtime.support.system import System
 if getenv("IOCTL"): import extra.qcom_gpu_driver.opencl_ioctl  # noqa: F401  # pylint: disable=unused-import
@@ -116,7 +116,7 @@ class QCOMComputeQueue(HWQueue):
     data, lib = qcom_build_program(self.dev, prg, self.devs)
     global_size, local_size = prg.arg.global_size, prg.arg.local_size
     if data.max_threads < prod(local_size): raise RuntimeError("Too many resources requested for launch")
-    if any(resolve(g*l>mx, False) for g,l,mx in zip(global_size, local_size, [65536, 65536, 65536])) and \
+    if any(g*l>mx for g,l,mx in zip(global_size, local_size, [65536, 65536, 65536]) if isinstance(g, int)) and \
        any(l>mx for l,mx in zip(local_size, [1024, 1024, 1024])):
       raise RuntimeError(f"Invalid global/local dims {global_size=}, {local_size=}")
 
@@ -226,8 +226,7 @@ class QCOMProgramData:
       self.samplers = [qreg.a6xx_tex_samp_0(wrap_s=(clamp_mode:=mesa.A6XX_TEX_CLAMP_TO_BORDER), wrap_t=clamp_mode, wrap_r=clamp_mode),
                        qreg.a6xx_tex_samp_1(unnorm_coords=True, cubemapseamlessfiltoff=True), 0, 0] * self.samp_cnt
 
-      # the descriptors go after the consts: compute has its own 256 vec4 const file on a6xx (ir3_compiler.c max_const_compute) and
-      # immediates like gguf's iq grid tables fill it past 2048 bytes
+      # descriptors go after the consts, a6xx compute has 4096 bytes of them (256 vec4)
       off = max(2048, round_up(imm_off + len(imm_vals), 0x40))
       self.tex_off, self.ibo_off, self.samp_off = off, off + 0x40 * self.tex_cnt, off + 0x40 * (self.tex_cnt + self.ibo_cnt)
       self.fregs, self.hregs = v.info.max_reg + 1, v.info.max_half_reg + 1
@@ -238,7 +237,7 @@ class QCOMProgramData:
     self.hw_stack_offset: int = round_up(next_power2(round_up(self.pvtmem, 512)) * 128 * 16, 0x1000)
     self.shared_size: int = max(1, (self.shmem - 1) // 1024)
     self.max_threads = min(1024, ((384 * 32) // (max(1, (self.fregs + round_up(self.hregs, 2) // 2)) * 128)) * 128)
-    self.kernargs_alloc_size = round_up(min(self.tex_off, self.ibo_off) + (self.tex_cnt + self.ibo_cnt) * 0x40 + len(self.samplers) * 4, 0x100)
+    self.kernargs_alloc_size = round_up(self.samp_off + len(self.samplers) * 4, 0x100)
 
   def _parse_lib(self, lib):
     # Extract image binary
