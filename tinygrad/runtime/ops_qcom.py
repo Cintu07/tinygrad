@@ -88,18 +88,19 @@ class QCOMComputeQueue(HWQueue):
 
   def kernargs(self, call:UOp, prg:UOp, data:QCOMProgramData) -> UOp:
     bufs, vals = [get_call_arg_uops(call)[g] for g in prg.arg.globals], get_call_var_uops(call, prg)
-    ubos = [bufs[slot] for _,slot,_,shape in data.signature if slot < len(bufs) and not is_image_shape(shape)]
     uavs = [(dt,shape,bufs[slot]) for _,slot,dt,shape in data.signature if slot < len(bufs) and is_image_shape(shape)]
     # NIR can reorder images to different texture slots
     ibos, texs = uavs[:data.ibo_cnt], [uavs[data.ibo_cnt + (data.tex_to_image[i] if data.NIR else i)] for i in range(data.tex_cnt)]
 
     args = [(off, UOp.const(val, dtypes.uint32 if sz == 4 else dtypes.uint16)) for val,off,sz in data.consts_info]
     args += layout_args(data.samplers, data.samp_off)
-    vals = [v.ccast(dt) for v,(_,_,dt,_) in zip(vals, data.signature[len(bufs):])]
+    # buffer addresses and vals in the kernel's order, images are bound separately
+    ubos = [bufs[i].getaddr(self.devs) if i < len(bufs) else vals[i-len(bufs)].ccast(dt)
+            for _,i,dt,shape in data.signature if not is_image_shape(shape)]
     if data.NIR:
-      args += layout_args([b.getaddr(self.devs) for b in ubos] + vals, data.buf_off)
+      args += layout_args(ubos, data.buf_off)
       if data.wgsz != 0xfc: args += layout_args(list(prg.arg.local_size), data.wgsz * 4)
-    else: args += list(zip(data.buf_offs, [b.getaddr(self.devs) for b in ubos] + vals))
+    else: args += list(zip(data.buf_offs, ubos))
 
     def _tex(b, ibo=False):
       imgdt, shape, buf = b

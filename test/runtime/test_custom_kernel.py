@@ -1,5 +1,6 @@
-import unittest
+import unittest, functools
 from tinygrad import Tensor, UOp, GlobalCounters, Context, Device
+from tinygrad.engine.realize import run_linear
 import numpy as np
 from tinygrad.dtype import AddrSpace, dtypes, Invalid
 from tinygrad.helpers import getenv
@@ -32,6 +33,20 @@ def custom_ignore_first_kernel(C:UOp, A:UOp, B:UOp) -> UOp:
   C, B = C.flatten(), B.flatten()
   i = UOp.range(C.numel(), 0)
   return C[i].store(B[i] + 1).end(i).sink(arg=KernelInfo(name=f"ignore_first_{C.numel()}"))
+
+def custom_add_var_kernel(*srcs:UOp, n_slot:int) -> UOp:
+  # the scalar takes slot n_slot, so the kernel signature is (n, C, B), (C, n, B) or (C, B, n). the arg at n_slot is unused
+  C, B = [s.flatten() for i,s in enumerate(srcs) if i != n_slot]
+  n = UOp.param(n_slot, dtypes.int, vmin_vmax=(0, 100), name="n", addrspace=AddrSpace.ALU)
+  i = UOp.range(C.numel(), 0)
+  return C[i].store(B[i] + n).end(i).sink(arg=KernelInfo(name=f"add_var_{n_slot}"))
+
+def custom_ignore_first_var_kernel(C:UOp, A:UOp, B:UOp) -> UOp:
+  # A is unused so the buffers are slots 0 and 2. n has no slot yet and must be numbered after 2, not into it
+  C, B = C.flatten(), B.flatten()
+  n = UOp.variable("n", 0, 100, dtype=dtypes.int, param=True)
+  i = UOp.range(C.numel(), 0)
+  return C[i].store(B[i] + n).end(i).sink(arg=KernelInfo(name=f"ignore_first_var_{C.numel()}"))
 
 def custom_sum(B:UOp, A:UOp) -> UOp:
   i = UOp.range(A.shape[0], 0, axis_type=AxisType.REDUCE)
@@ -177,6 +192,23 @@ class TestCustomKernel(unittest.TestCase):
     a, b = Tensor([100.0, 200, 300, 400]), Tensor([1.0, 2, 3, 4])
     out = Tensor.custom_kernel(Tensor.empty(4), a, b, fxn=custom_ignore_first_kernel)[0]
     self.assertEqual(out.tolist(), [2, 3, 4, 5])
+
+  def test_scalar_arg_any_position(self):
+    # the scalar is the kernel's first, middle or last param. launching it in the buffers-then-vals order reads a buffer address as an int
+    for n_slot in range(3):
+      with self.subTest(n_slot=n_slot):
+        srcs = [Tensor.empty(4, dtype=dtypes.int), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()]
+        srcs.insert(n_slot, Tensor.empty(4, dtype=dtypes.int))  # the arg at the scalar's slot is unused
+        out_pos = 1 if n_slot == 0 else 0
+        out = Tensor.custom_kernel(*srcs, fxn=functools.partial(custom_add_var_kernel, n_slot=n_slot))[out_pos]
+        run_linear(out.schedule_linear(), var_vals={"n": 5})
+        self.assertEqual(out.tolist(), [6, 7, 8, 9])
+
+  def test_unused_arg_then_var(self):
+    srcs = (Tensor.empty(4, dtype=dtypes.int), Tensor.empty(4, dtype=dtypes.int), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize())
+    out = Tensor.custom_kernel(*srcs, fxn=custom_ignore_first_var_kernel)[0]
+    run_linear(out.schedule_linear(), var_vals={"n": 5})
+    self.assertEqual(out.tolist(), [6, 7, 8, 9])
 
   def test_sum(self):
     a = Tensor([1.0, 2, 3, 4, 5])

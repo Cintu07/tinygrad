@@ -1305,13 +1305,13 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
 
   def to_elf(self) -> TinyELF:
     assert self.op is Ops.PROGRAM and isinstance(self.arg, ProgramInfo), "to_elf should only be called on a PROGRAM ast"
-    params = tuple(u for u in self.src[1].src if u.op is Ops.PARAM and u.addrspace != AddrSpace.ALU)
-    # sig slots are compact: buffers in globals order (runtimes launch buffers in that order), then vars. raw call-arg
+    params = sorted((u for u in self.src[1].src if u.op is Ops.PARAM and u.addrspace != AddrSpace.ALU), key=lambda u: u.arg.slot)
+    # sig is in the kernel's argument order. each entry indexes (*bufs, *vals): buffers in globals order, then vars. raw call-arg
     # positions skip buffers for kernels using a sparse subset of the call's buffers (CL binds bufs[slot])
     gmap = {s:j for j, s in enumerate(self.arg.globals)}
-    sig = tuple((u.arg.name, gmap[u.arg.slot], u.dtype, u._shape) for u in params) + \
-          tuple((v.arg.name, len(self.arg.globals)+j, v.dtype, v._shape) for j, v in enumerate(self.arg.vars))
-    return TinyELF(self.src[3].arg, self.src[0].arg.function_name, self.arg.target, sig, self.key)
+    sig = self.arg.in_order([(u.arg.name, gmap[u.arg.slot], u.dtype, u._shape) for u in params],
+                            [(v.arg.name, len(self.arg.globals)+j, v.dtype, v._shape) for j, v in enumerate(self.arg.vars)])
+    return TinyELF(self.src[3].arg, self.src[0].arg.function_name, self.arg.target, tuple(sig), self.key)
 
 @dataclass(frozen=True)
 class KernelInfo:
@@ -1341,6 +1341,10 @@ class ProgramInfo:
   def vals(self, var_vals:dict[str, int]) -> tuple[int, ...]:
     try: return tuple(var_vals[k.expr] for k in self.vars)
     except KeyError as e: raise RuntimeError(f"unbound Variable {e}") from None
+
+  def in_order(self, bufs:Sequence, vals:Sequence) -> list:
+    """bufs (globals order) and vals (vars order) in the order the kernel takes them: every param by its slot, buffers and vars mixed"""
+    return [x for _,x in sorted([*zip(self.globals, bufs), *zip([v.arg.slot for v in self.vars], vals)], key=lambda sx: sx[0])]
 
   @staticmethod
   def from_sink(sink:UOp, target:Target=Target()) -> ProgramInfo:

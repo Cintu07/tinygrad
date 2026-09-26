@@ -376,8 +376,8 @@ def full_rewrite_to_sink(ast:UOp, ren:Renderer, optimize:bool=True) -> UOp:
   # this was the linearizer
   sink = graph_rewrite(sink, pm_add_control_flow, ctx=CFGContext(sink), name="add control flow", bottom_up=True)
 
-  # put unnumbered variable PARAMs in slots
-  num_params = len([x for x in sink.toposort() if x.op is Ops.PARAM and x.arg.slot != -1])
+  # put unnumbered variable PARAMs in slots after the last used one, an unused call arg leaves a gap that isn't free
+  num_params = max([x.arg.slot for x in sink.toposort() if x.op is Ops.PARAM and x.arg.slot != -1], default=-1) + 1
   sink = graph_rewrite(sink, pm_number_params, ctx=[num_params], name="number params with -1", walk=True)
 
   if VIZ: graph_rewrite(sink, PatternMatcher([]), name="View Output AST")
