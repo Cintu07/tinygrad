@@ -35,11 +35,11 @@ def custom_ignore_first_kernel(C:UOp, A:UOp, B:UOp) -> UOp:
   return C[i].store(B[i] + 1).end(i).sink(arg=KernelInfo(name=f"ignore_first_{C.numel()}"))
 
 def custom_add_var_kernel(*srcs:UOp, n_slot:int) -> UOp:
-  # the scalar takes slot n_slot, so the kernel signature is (n, C, B), (C, n, B) or (C, B, n). the arg at n_slot is unused
-  C, B = [s.flatten() for i,s in enumerate(srcs) if i != n_slot]
+  # C = sum of the Bs + n. the scalar takes slot n_slot, so with one B the signature is (n, C, B), (C, n, B) or (C, B, n). the arg at n_slot is unused
+  C, *Bs = [s.flatten() for i,s in enumerate(srcs) if i != n_slot]
   n = UOp.param(n_slot, dtypes.int, vmin_vmax=(0, 100), name="n", addrspace=AddrSpace.ALU)
   i = UOp.range(C.numel(), 0)
-  return C[i].store(B[i] + n).end(i).sink(arg=KernelInfo(name=f"add_var_{n_slot}"))
+  return C[i].store(functools.reduce(lambda a,b: a+b, [B[i] for B in Bs]) + n).end(i).sink(arg=KernelInfo(name=f"add_var_{n_slot}_{len(Bs)}"))
 
 def custom_ignore_first_var_kernel(C:UOp, A:UOp, B:UOp) -> UOp:
   # A is unused so the buffers are slots 0 and 2. n has no slot yet and must be numbered after 2, not into it
@@ -203,6 +203,14 @@ class TestCustomKernel(unittest.TestCase):
         out = Tensor.custom_kernel(*srcs, fxn=functools.partial(custom_add_var_kernel, n_slot=n_slot))[out_pos]
         run_linear(out.schedule_linear(), var_vals={"n": 5})
         self.assertEqual(out.tolist(), [6, 7, 8, 9])
+
+  def test_scalar_arg_past_registers(self):
+    # 9 params with the scalar in the middle, x86 passes the ones after the 6th (4th on windows) on the stack
+    srcs = [Tensor.empty(4, dtype=dtypes.int)] + [Tensor([1, 2, 3, 4], dtype=dtypes.int).realize() for _ in range(7)]
+    srcs.insert(4, Tensor.empty(4, dtype=dtypes.int))
+    out = Tensor.custom_kernel(*srcs, fxn=functools.partial(custom_add_var_kernel, n_slot=4))[0]
+    run_linear(out.schedule_linear(), var_vals={"n": 5})
+    self.assertEqual(out.tolist(), [12, 19, 26, 33])
 
   def test_unused_arg_then_var(self):
     srcs = (Tensor.empty(4, dtype=dtypes.int), Tensor.empty(4, dtype=dtypes.int), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize())
