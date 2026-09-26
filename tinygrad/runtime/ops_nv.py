@@ -173,9 +173,10 @@ class NVComputeQueue(NVQueue):
     qmd.set_program_addr(lib.getaddr(self.devs) + data.prog_off)
     for j, (off, _) in data.constbufs.items():
       qmd.set_constant_buf_addr(j, qmd_addr + UOp.const(self.qmd_sz, dtypes.uint64) if j == 0 else lib.getaddr(self.devs) + off)
-    bufs, vals = [get_call_arg_uops(call)[j] for j in prg.arg.globals], get_call_var_uops(call, prg)
+    bufs, vals = [call.src[1+j] for j in prg.arg.globals], get_call_var_uops(call, prg)
     qmd.mv[self.qmd_sz:(at:=self.qmd_sz + len(data.cbuf_0) * 4)] = array.array('I', data.cbuf_0).tobytes() # constant buffer 0: the driver params
-    qmd.patches |= dict(layout_args(prg.arg.in_order([b.getaddr(self.devs) for b in bufs], [v.ccast(dt) for v, dt in zip(vals, data.vars)]), at))
+    args = TinyELF.args(prg.to_elf().signature, [b.getaddr(self.devs) for b in bufs], [v.ccast(dt) for v, dt in zip(vals, data.vars)])
+    qmd.patches |= dict(layout_args(args, at))
 
     if self.prev_qmd is None:
       if self.dev.pma_enabled: self.nvm(1, nv_gpu.NVC6C0_PM_TRIGGER, 0)

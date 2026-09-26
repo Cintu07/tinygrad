@@ -1299,7 +1299,9 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   # one-line convenience for the single-output case: self is the value
   def call_with_output(self, *srcs:UOp, **kwargs) -> UOp: return UOp.call_with_outputs((self,), *srcs, **kwargs)[0]
   def custom_kernel(*srcs:UOp, fxn:Callable, grad_fxn:Callable|None=None) -> list[UOp]:
-    placeholders = [UOp.placeholder_like(s, slot=i) for i,s in enumerate(srcs)]
+    # a scalar input is a scalar param in its place. it keeps the Variable's name, the value binds to it by name
+    placeholders = [UOp(Ops.PARAM, arg=replace((s.src[0] if s.op is Ops.AFTER else s).arg, slot=i)) if s.is_bound_var or s.is_variable else
+                    UOp.placeholder_like(s, slot=i) for i,s in enumerate(srcs)]
     kernel = fxn(*placeholders).call(*srcs, grad_fxn=grad_fxn)
     return [s.after(kernel) for s in srcs]
 
@@ -1343,10 +1345,6 @@ class ProgramInfo:
   def vals(self, var_vals:dict[str, int]) -> tuple[int, ...]:
     try: return tuple(var_vals[k.expr] for k in self.vars)
     except KeyError as e: raise RuntimeError(f"unbound Variable {e}") from None
-
-  def in_order(self, bufs:Sequence, vals:Sequence) -> list:
-    """bufs (globals order) and vals (vars order) in the order the kernel takes them: every param by its slot, buffers and vars mixed"""
-    return [x for _,x in sorted([*zip(self.globals, bufs), *zip([v.arg.slot for v in self.vars], vals)], key=lambda sx: sx[0])]
 
   @staticmethod
   def from_sink(sink:UOp, target:Target=Target()) -> ProgramInfo:

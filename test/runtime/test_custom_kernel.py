@@ -1,5 +1,5 @@
 import unittest, functools
-from tinygrad import Tensor, UOp, GlobalCounters, Context, Device
+from tinygrad import Tensor, UOp, GlobalCounters, Context, Device, Variable
 from tinygrad.engine.realize import run_linear
 import numpy as np
 from tinygrad.dtype import AddrSpace, dtypes, Invalid
@@ -35,11 +35,11 @@ def custom_ignore_first_kernel(C:UOp, A:UOp, B:UOp) -> UOp:
   return C[i].store(B[i] + 1).end(i).sink(arg=KernelInfo(name=f"ignore_first_{C.numel()}"))
 
 def custom_add_var_kernel(*srcs:UOp, n_slot:int) -> UOp:
-  # C = sum of the Bs + n. the scalar takes slot n_slot, so with one B the signature is (n, C, B), (C, n, B) or (C, B, n). the arg at n_slot is unused
+  # C = the sum of the Bs + the scalar input at n_slot. with one B the kernel takes (n, C, B), (C, n, B) or (C, B, n)
   C, *Bs = [s.flatten() for i,s in enumerate(srcs) if i != n_slot]
-  n = UOp.param(n_slot, dtypes.int, vmin_vmax=(0, 100), name="n", addrspace=AddrSpace.ALU)
   i = UOp.range(C.numel(), 0)
-  return C[i].store(functools.reduce(lambda a,b: a+b, [B[i] for B in Bs]) + n).end(i).sink(arg=KernelInfo(name=f"add_var_{n_slot}_{len(Bs)}"))
+  out = functools.reduce(lambda a,b: a+b, [B[i] for B in Bs]) + srcs[n_slot]
+  return C[i].store(out).end(i).sink(arg=KernelInfo(name=f"add_var_{n_slot}_{len(Bs)}"))
 
 def custom_ignore_first_var_kernel(C:UOp, A:UOp, B:UOp) -> UOp:
   # A is unused so the buffers are slots 0 and 2. n has no slot yet and must be numbered after 2, not into it
@@ -194,22 +194,19 @@ class TestCustomKernel(unittest.TestCase):
     self.assertEqual(out.tolist(), [2, 3, 4, 5])
 
   def test_scalar_arg_any_position(self):
-    # the scalar is the kernel's first, middle or last param. launching it in the buffers-then-vals order reads a buffer address as an int
+    # the scalar is the first, middle or last input
     for n_slot in range(3):
       with self.subTest(n_slot=n_slot):
         srcs = [Tensor.empty(4, dtype=dtypes.int), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()]
-        srcs.insert(n_slot, Tensor.empty(4, dtype=dtypes.int))  # the arg at the scalar's slot is unused
-        out_pos = 1 if n_slot == 0 else 0
-        out = Tensor.custom_kernel(*srcs, fxn=functools.partial(custom_add_var_kernel, n_slot=n_slot))[out_pos]
-        run_linear(out.schedule_linear(), var_vals={"n": 5})
+        srcs.insert(n_slot, Tensor(Variable("n", 0, 100, dtypes.int).bind(5)))
+        out = Tensor.custom_kernel(*srcs, fxn=functools.partial(custom_add_var_kernel, n_slot=n_slot))[1 if n_slot == 0 else 0]
         self.assertEqual(out.tolist(), [6, 7, 8, 9])
 
   def test_scalar_arg_past_registers(self):
-    # 9 params with the scalar in the middle, x86 passes the ones after the 6th (4th on windows) on the stack
+    # 9 inputs with the scalar in the middle, x86 passes the ones after the 6th (4th on windows) on the stack
     srcs = [Tensor.empty(4, dtype=dtypes.int)] + [Tensor([1, 2, 3, 4], dtype=dtypes.int).realize() for _ in range(7)]
-    srcs.insert(4, Tensor.empty(4, dtype=dtypes.int))
+    srcs.insert(4, Tensor(Variable("n", 0, 100, dtypes.int).bind(5)))
     out = Tensor.custom_kernel(*srcs, fxn=functools.partial(custom_add_var_kernel, n_slot=4))[0]
-    run_linear(out.schedule_linear(), var_vals={"n": 5})
     self.assertEqual(out.tolist(), [12, 19, 26, 33])
 
   def test_unused_arg_then_var(self):
