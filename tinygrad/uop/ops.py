@@ -1311,19 +1311,23 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   # one-line convenience for the single-output case: self is the value
   def call_with_output(self, *srcs:UOp, **kwargs) -> UOp: return UOp.call_with_outputs((self,), *srcs, **kwargs)[0]
   def custom_kernel(*srcs:UOp, fxn:Callable, grad_fxn:Callable|None=None) -> list[UOp]:
-    placeholders = [UOp.placeholder_like(s, slot=i) for i,s in enumerate(srcs)]
+    # a Variable input is a scalar param in its place. it keeps its name (the schedule's own scalar params are nameless), not its value
+    placeholders = [UOp(Ops.PARAM, arg=replace(s.arg, slot=i, val=None)) if s.is_variable else UOp.placeholder_like(s, slot=i)
+                    for i,s in enumerate(srcs)]
     kernel = fxn(*placeholders).call(*srcs, grad_fxn=grad_fxn)
     return [s.after(kernel) for s in srcs]
 
   def to_elf(self) -> TinyELF:
     assert self.op is Ops.PROGRAM and isinstance(self.arg, ProgramInfo), "to_elf should only be called on a PROGRAM ast"
-    params = tuple(u for u in self.src[1].src if u.op is Ops.PARAM and u.addrspace != AddrSpace.ALU)
-    # sig slots are compact: buffers in globals order (runtimes launch buffers in that order), then vars. raw call-arg
+    params = [u for u in self.src[1].src if u.op is Ops.PARAM and u.addrspace != AddrSpace.ALU]
+    # sig is in the kernel's argument order (by slot). each entry indexes (*bufs, *vals): buffers in globals order, then vars. raw call-arg
     # positions skip buffers for kernels using a sparse subset of the call's buffers (CL binds bufs[slot])
+    # a buffer can be two params (IMAGE reads it as an image), and a buffer passed on the stack has no param left after isel (x86)
     gmap = {s:j for j, s in enumerate(self.arg.globals)}
-    sig = tuple((u.arg.name, gmap[u.arg.slot], u.dtype, u._shape) for u in params) + \
-          tuple((v.arg.name, len(self.arg.globals)+j, v.dtype, v._shape) for j, v in enumerate(self.arg.vars))
-    return TinyELF(self.src[3].arg, self.src[0].arg.function_name, self.arg.target, sig, self.key)
+    sig = [(u.arg.slot, (u.arg.name, gmap[u.arg.slot], u.dtype, u._shape)) for u in params]
+    sig += [(s, (None, gmap[s], dtypes.uint64, ())) for s in self.arg.globals if s not in {u.arg.slot for u in params}]
+    sig += [(v.arg.slot, (v.arg.name, len(self.arg.globals)+j, v.dtype, v._shape)) for j, v in enumerate(self.arg.vars)]
+    return TinyELF(self.src[3].arg, self.src[0].arg.function_name, self.arg.target, tuple(e for _,e in sorted(sig, key=lambda x: x[0])), self.key)
 
   @property
   def src_without_body(self) -> tuple[UOp, ...]: return self.src[1:] if self.op is Ops.CALL else self.src
