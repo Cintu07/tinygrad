@@ -172,16 +172,15 @@ def exec_kernel(ctx:ExecContext, call:UOp, ast:UOp, devices=None) -> list[float|
 
 def exec_validate(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
   import numpy as np
-  # the call is (*cpu copies, *device args) with scalars in place, resolve_params drops them: bi maps a slot to its buffer
-  bi = [k for k, s in enumerate(call.src[1:]) if not s.is_bound_var].index
-  for bufs, device_vars in unwrap_multi(call, resolve_params(call, ctx.input_uops)):
-    bufs, dev_bufs = bufs[:len(bufs)//2], bufs[len(bufs)//2:]
+  # resolve_params drops the bound scalars, so key the buffers by their position in the call. that's what the kernel's slots are
+  pos = [k for k, s in enumerate(call.src[1:]) if not s.is_bound_var]
+  for lane, device_vars in unwrap_multi(call, resolve_params(call, ctx.input_uops)):
+    bufs, dev_bufs = dict(zip(pos, lane[:len(lane)//2])), dict(zip(pos, lane[len(lane)//2:]))
     var_vals = {**ctx.var_vals, **device_vars}
     cpu_rt = get_runtime("CPU", prg:=to_program(ast.src[0], Device["CPU"].renderer))
     global_size, local_size = prg.arg.launch_dims(var_vals)
-    cpu_rt(*[bufs[bi(i)].ensure_allocated()._buf for i in prg.arg.globals], global_size=global_size, local_size=local_size,
-           vals=prg.arg.vals(var_vals))
-    for i in prg.arg.outs: np.testing.assert_allclose(dev_bufs[bi(i)].ensure_allocated().numpy(), bufs[bi(i)].numpy(), rtol=1e-3, atol=1e-3)
+    cpu_rt(*[bufs[i].ensure_allocated()._buf for i in prg.arg.globals], global_size=global_size, local_size=local_size, vals=prg.arg.vals(var_vals))
+    for i in prg.arg.outs: np.testing.assert_allclose(dev_bufs[i].ensure_allocated().numpy(), bufs[i].numpy(), rtol=1e-3, atol=1e-3)
   return []
 
 def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
@@ -211,11 +210,13 @@ pm_flatten_linear = PatternMatcher([
 ])
 
 def _validate(call:UOp, sink:UOp) -> UOp:
-  params = call.src[1:] # scalars keep their place so the kernel's slots still line up
-  shadows = tuple(p if p.is_bound_var else
-                  UOp.new_buffer(("CPU",)*len(p.device) if isinstance(p.device, tuple) else "CPU", prod(p.max_shape), p.dtype) for p in params)
-  copies = tuple(s.store_call(p) for s, p in zip(shadows, params) if not p.is_bound_var)
-  return UOp(Ops.LINEAR, src=copies + (call, UOp.custom_function("validate", sink).call(*shadows, *params)))
+  params = get_call_arg_uops(call)
+  shadows = tuple(UOp.new_buffer(("CPU",)*len(p.device) if isinstance(p.device, tuple) else "CPU", prod(p.max_shape), p.dtype) for p in params)
+  copies = tuple(s.store_call(p) for s, p in zip(shadows, params))
+  # the cpu args are in the call's order, the bound scalars stay in their place
+  it = iter(shadows)
+  cpu_args = tuple(s if s.is_bound_var else next(it) for s in call.src[1:])
+  return UOp(Ops.LINEAR, src=copies + (call, UOp.custom_function("validate", sink).call(*cpu_args, *call.src[1:])))
 pm_validate = PatternMatcher([(UPat(Ops.CALL, src=(UPat(Ops.SINK, name="sink"),), name="call", allow_any_len=True), _validate)]) + pm_flatten_linear
 
 # ctx is beam value

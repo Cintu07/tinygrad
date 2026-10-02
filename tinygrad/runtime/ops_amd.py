@@ -359,9 +359,9 @@ class AMDComputeQueue(HWQueue):
   ### exec
 
   def kernargs(self, call:UOp, prg:UOp, data:AMDProgramData) -> list[UOp]:
-    # a bound value is a bare const, the var has the width
-    args = TinyELF.args(prg.to_elf().signature, [call.src[1+gi].getaddr(self.devs) for gi in prg.arg.globals],
-                        [b.ccast(v.dtype) for v, b in zip(prg.arg.vars, get_call_var_uops(call, prg))])
+    bufs = [call.src[1+gi].getaddr(self.devs) for gi in prg.arg.globals]
+    vals = [b.ccast(v.dtype) for v, b in zip(prg.arg.vars, get_call_var_uops(call, prg))] # a bound value is a bare const, the var has the width
+    args = TinyELF.args(prg.to_elf().signature, bufs, vals)
     return pack_args(layout_args(args), data.kernargs_segment_size) + (dispatch_packet(data, prg.arg) if data.enable_dispatch_ptr else [])
 
   def exec(self, call:UOp, prg:UOp):

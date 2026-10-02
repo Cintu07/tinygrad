@@ -1323,9 +1323,9 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
     # sig is in the kernel's argument order (by slot). each entry indexes (*bufs, *vals): buffers in globals order, then vars. raw call-arg
     # positions skip buffers for kernels using a sparse subset of the call's buffers (CL binds bufs[slot])
     # a buffer can be two params (IMAGE reads it as an image), and a buffer passed on the stack has no param left after isel (x86)
-    gmap = {s:j for j, s in enumerate(self.arg.globals)}
+    gmap, has_param = {s:j for j, s in enumerate(self.arg.globals)}, {u.arg.slot for u in params}
     sig = [(u.arg.slot, (u.arg.name, gmap[u.arg.slot], u.dtype, u._shape)) for u in params]
-    sig += [(s, (None, gmap[s], dtypes.uint64, ())) for s in self.arg.globals if s not in {u.arg.slot for u in params}]
+    sig += [(s, (None, gmap[s], dtypes.uint64, ())) for s in self.arg.globals if s not in has_param]
     sig += [(v.arg.slot, (v.arg.name, len(self.arg.globals)+j, v.dtype, v._shape)) for j, v in enumerate(self.arg.vars)]
     return TinyELF(self.src[3].arg, self.src[0].arg.function_name, self.arg.target, tuple(e for _,e in sorted(sig, key=lambda x: x[0])), self.key)
 

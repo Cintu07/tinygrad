@@ -65,8 +65,9 @@ class DSPProgram(Program['DSPDevice']):
 
     pra, fds, attrs, _ = rpc_prep_args(ins=[var_vals_mv:=memoryview(bytearray((len(bufs)+len(vals))*8)), off_mv:=memoryview(bytearray(len(bufs)*4))],
                                        outs=[timer:=memoryview(bytearray(8)).cast('Q')], in_fds=[b.share_info.fd for b in bufs])
-    for i,(a,(_,j,dt,_)) in enumerate(zip(TinyELF.args(self.signature, bufs, vals), self.signature)):
-      struct.pack_into('i' if j < len(bufs) else unwrap(dt.fmt), var_vals_mv, i*8, a.size if j < len(bufs) else a)
+    for i,(_,j,dt,_) in enumerate(self.signature):
+      if j < len(bufs): struct.pack_into('i', var_vals_mv, i*8, bufs[j].size)
+      else: struct.pack_into(unwrap(dt.fmt), var_vals_mv, i*8, vals[j-len(bufs)])
     off_mv.cast('I')[:] = array.array('I', tuple(b.offset for b in bufs))
     self.dev.exec_lib(self.lib, rpc_sc(method=2, ins=2, outs=1, fds=len(bufs)), pra, fds, attrs)
     return timer[0] / 1e6
