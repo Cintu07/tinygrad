@@ -174,8 +174,8 @@ def exec_validate(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
   import numpy as np
   # resolve_params drops the bound scalars, so key the buffers by their position in the call. that's what the kernel's slots are
   pos = [k for k, s in enumerate(call.src[1:]) if not s.is_bound_var]
-  for bufs, device_vars in unwrap_multi(call, resolve_params(call, ctx.input_uops)):
-    bufs, dev_bufs = dict(zip(pos, bufs[:len(bufs)//2])), dict(zip(pos, bufs[len(bufs)//2:]))
+  for lane, device_vars in unwrap_multi(call, resolve_params(call, ctx.input_uops)):
+    bufs, dev_bufs = dict(zip(pos, lane[:len(lane)//2])), dict(zip(pos, lane[len(lane)//2:]))
     var_vals = {**ctx.var_vals, **device_vars}
     cpu_rt = get_runtime("CPU", prg:=to_program(ast.src[0], Device["CPU"].renderer))
     global_size, local_size = prg.arg.launch_dims(var_vals)
