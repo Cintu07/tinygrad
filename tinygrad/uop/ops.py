@@ -1306,9 +1306,8 @@ class UOp(RandMixin, metaclass=UOpMetaClass):
   # one-line convenience for the single-output case: self is the value
   def call_with_output(self, *srcs:UOp, **kwargs) -> UOp: return UOp.call_with_outputs((self,), *srcs, **kwargs)[0]
   def custom_kernel(*srcs:UOp, fxn:Callable, grad_fxn:Callable|None=None) -> list[UOp]:
-    # a Variable input is a scalar param in its place. it keeps its name (the schedule's own scalar params are nameless), not its value
-    placeholders = [UOp(Ops.PARAM, arg=replace(s.arg, slot=i, val=None)) if s.is_variable else UOp.placeholder_like(s, slot=i)
-                    for i,s in enumerate(srcs)]
+    # a Variable input is the Variable itself in the kernel, bound by name. a slot on it would bind it to the outer call's scalar at that slot
+    placeholders = [s.unbound() if s.is_variable else UOp.placeholder_like(s, slot=i) for i,s in enumerate(srcs)]
     kernel = fxn(*placeholders).call(*srcs, grad_fxn=grad_fxn)
     return [s.after(kernel) for s in srcs]
 

@@ -212,6 +212,14 @@ class TestCustomKernel(unittest.TestCase):
     out = Tensor.custom_kernel(*srcs, fxn=functools.partial(custom_add_var_kernel, n_slot=0))[1]
     self.assertEqual(out.tolist(), [6, 7, 8, 9])
 
+  def test_scalar_arg_with_other_variable(self):
+    # another bound Variable in the same schedule must not take the place of n
+    other = (Tensor([1, 2, 3, 4], dtype=dtypes.int) + Tensor(Variable("m", 0, 100, dtypes.int).bind(70))).contiguous()
+    srcs = [Tensor.empty(4, dtype=dtypes.int), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize(), Tensor(Variable("n", 0, 100, dtypes.int).bind(5))]
+    out = Tensor.custom_kernel(*srcs, fxn=functools.partial(custom_add_var_kernel, n_slot=2))[0]
+    Tensor.realize(other, out)
+    self.assertEqual(out.tolist(), [6, 7, 8, 9])
+
   def test_scalar_arg_past_registers(self):
     # 9 inputs with the scalar in the middle, x86 passes the ones after the 6th (4th on windows) on the stack
     srcs = [Tensor.empty(4, dtype=dtypes.int)] + [Tensor([1, 2, 3, 4], dtype=dtypes.int).realize() for _ in range(7)]
