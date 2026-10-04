@@ -72,12 +72,12 @@ def create_schedule(sched_sink:UOp) -> UOp:
       assert k.op is Ops.CALL, f"unexpected op in queue: {k.op}"
       buf_uops = tuple(_unwrap_src(s).buf_uop for s in k.src[1:] if not s.is_bound_var)
       # the runtime indexes the call's buffers (scalars dropped) with the kernel's buffer slots, so a scalar before a buffer would
-      # shift it. renumber the buffer params to their index among the buffers
+      # shift it. renumber a kernel's buffer params to their index among the buffers. a LINEAR body binds its params by position
       slot = {i:j for j,i in enumerate(i for i,s in enumerate(k.src[1:]) if not s.is_variable)}
       body = k.body
-      if any(i != j for i,j in slot.items()):
+      if body.op is Ops.SINK and any(i != j for i,j in slot.items()):
         body = body.substitute({p:p.replace(arg=replace(p.arg, slot=slot[p.arg.slot])) for p in body.toposort(enter_calls=False)
-                                if p.op is Ops.PARAM and not p.is_variable}, walk=True)
+                                if p.op is Ops.PARAM and p.addrspace is not AddrSpace.ALU}, walk=True)
       linearized.append(k.replace(src=(body, *buf_uops)))
       for x in children.get(rk, []):
         in_degree[x] -= 1
