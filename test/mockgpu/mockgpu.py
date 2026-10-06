@@ -1,5 +1,8 @@
 import ctypes, time, os, builtins, fcntl, typing, traceback
-from tinygrad.helpers import DEV, unwrap
+from dataclasses import replace
+from tinygrad.helpers import DEV, unwrap, dedup, to_tuple
+from tinygrad.device import Compiled
+from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher
 from tinygrad.runtime.support.system import FileIOInterface
 from tinygrad.runtime.autogen import libc
 from test.mockgpu.nv.nvdriver import NVDriver
@@ -12,17 +15,31 @@ drivers = [cls() for t in DEV.value if (cls:={"MOCKPCI+AMD": AMDriver, "MOCKKFD+
                                               "MOCK+NV": NVDriver, "MOCK+QCOM": QCOMDriver}.get(f"{t.interface}+{t.device}"))]
 tracked_fds: dict[int, typing.Any] = {}
 
-# hcq2 ccall runs libc's ioctl from generated code instead of FileIOInterface.ioctl, so route fake fds to their driver there too
+# compiled submits (hcq2 ccall) call ioctl directly. they're renamed to mockgpu_ioctl below: under its own name the symbol can't be found
+# first in another loaded library, the way a plain "ioctl" resolves to the real one through any lib that links libc
 _ioctl_t = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_ulong, ctypes.c_void_p)
-_real_ioctl = _ioctl_t(unwrap(ctypes.cast(getattr(libc.dll, "ioctl"), ctypes.c_void_p).value))
-def _ioctl(fd, request, argp):
+_real_ioctl = _ioctl_t(unwrap(ctypes.cast(libc.dll.ioctl, ctypes.c_void_p).value))
+@_ioctl_t
+def mockgpu_ioctl(fd:int, request:int, argp:int) -> int:
   try: return tracked_fds[fd].ioctl(fd, request, argp) if fd in tracked_fds else _real_ioctl(fd, request, argp)
   except Exception:
-    traceback.print_exc()  # exceptions can't propagate into the generated code that called us
+    traceback.print_exc()  # the compiled caller can't see a python exception
     return -1
-_mock_ioctl = _ioctl_t(_ioctl)
-for k, v in {"__name__": "ioctl", "__module__": "tinygrad.runtime.autogen.libc"}.items(): setattr(_mock_ioctl, k, v)  # ccall reads these
-setattr(libc.dll, "ioctl", _mock_ioctl)
+setattr(libc.dll, "mockgpu_ioctl", mockgpu_ioctl)
+
+@ctypes.CFUNCTYPE(None, ctypes.c_uint64)
+def mockgpu_doorbell(addr:int): # compiled stores aren't tracked, so the submits report their doorbells
+  for st,en,_,wcb in [x for d in drivers for x in d.tracked_addresses]:
+    if st <= addr <= en: wcb(None, addr - st)
+setattr(libc.dll, "mockgpu_doorbell", mockgpu_doorbell)
+
+mocked = {t.device for t in DEV.value if t.interface.startswith("MOCK")}
+def hook_doorbells(s:UOp) -> UOp|None:
+  hooks = tuple(UOp.custom_function("mockgpu_doorbell").call(b.after(c).getaddr("CPU")) for c in s.toposort() if c.op is Ops.CALL
+                for b in c.src[1:] if b.op is Ops.ALLOC and "doorbell" in str(b.tag) and to_tuple(b.device)[0].split(":")[0] in mocked)
+  return None if all(h in s.src for h in hooks) else s.replace(src=tuple(dedup(s.src + hooks)))
+Compiled.pm_lower = PatternMatcher([(UPat(Ops.SINK, name="s"), hook_doorbells),
+  (UPat(Ops.CUSTOM_FUNCTION, name="f"), lambda f: f.replace(arg=replace(f.arg, name="mockgpu_ioctl")) if f.arg.name == "ioctl" else None)])
 
 original_memoryview = builtins.memoryview
 class TrackedMemoryView:

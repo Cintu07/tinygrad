@@ -111,7 +111,7 @@ def split_reduceop(reduce:UOp, x:UOp):
 
   # get expanded by rangeifying the UOp x
   indexed = x.index(*[UOp.range(s, i) if resolve(s>1) else 0 for i,s in enumerate(x.shape)])
-  range_nums = [y.arg[0] for y in indexed.substitute({x.base:UOp(Ops.NOOP)}, extra_pm=pm_mops).ranges]
+  range_nums = [y.axis_id[0] for y in indexed.substitute({x.base:UOp(Ops.NOOP)}, extra_pm=pm_mops).ranges]
   is_expanded = [i not in range_nums for i in range(len(x.shape))]
 
   if not (split_candidates:=[(i,d) for i in range(reduce.arg[1])
@@ -122,7 +122,7 @@ def split_reduceop(reduce:UOp, x:UOp):
   splitted = x.reshape(splitted_shape).permute(tuple([d for d in range(len(splitted_shape)) if d!=dim_to_split]+[dim_to_split]))
   if DEBUG >= 3: print(f"split {divisor}: {x.shape} -> {splitted.shape} -> {reduce.shape}")
   # reduce original axes, then split
-  return splitted._rop(reduce.arg[0], tuple(range(reduce.arg[1]))).contiguous()._rop(reduce.arg[0], (len(reduce.shape),)).reshape(reduce.shape)
+  return splitted._rop(reduce.arg[0], tuple(range(reduce.arg[1]))).contiguous()._rop(reduce.arg[0], (len(reduce.shape),))
 
 def resolve_function(c:UOp) -> UOp|None:
   if not c.is_inline_call: return None
@@ -152,7 +152,7 @@ def resolve_function(c:UOp) -> UOp|None:
 # shape-changing bitcast
 def expand_bitcast(bc:UOp) -> UOp|None:
   x = bc.src[0]
-  if (ns:=bc.dtype.itemsize) == (os:=x.dtype.itemsize) or (isinstance(x.device, str) and x.device.startswith("DISK")): return None
+  if (ns:=bc.dtype.itemsize) == (os:=x.dtype.itemsize) or x.on_disk(): return None
   new_uint, tmp = to_dtype(f"uint{8*ns}"), x.bitcast(to_dtype(f"uint{8*os}"))
   if ns > os:
     tmp = tmp.reshape(x.shape[:-1] + (x.shape[-1]//(rate := ns//os), rate))
@@ -164,12 +164,15 @@ def expand_bitcast(bc:UOp) -> UOp|None:
 def copy_to_anon_store(x:UOp, copy:UOp):
   # copies are always cross device: pad to the max shape so the copy reads a whole buffer (SDMA can't do offset copies)
   x = x.pad_to(x.max_shape)
-  buf = UOp(Ops.ALLOC, arg=ParamArg(next(UOp.unique_num), copy.dtype, prod(x.max_shape), device=copy.device)).reshape(x.max_shape)
+  # the buffer takes the DEVICE range from the copy (no-op for single device copies)
+  buf = UOp(Ops.ALLOC, src=copy.src[1:],
+            arg=ParamArg(next(UOp.unique_num), copy.dtype, prod(x.max_shape), device=copy.device)).reshape(x.max_shape)
   return buf.after(buf.store(x)).shrink_to(copy.shape)
 
 def stage_to_anon_store(x:UOp, stg:UOp):
   # the buffer created here is inside the call and is not persisted, like the buffers created for copies
-  buf = UOp(Ops.ALLOC, arg=ParamArg(next(UOp.unique_num), stg.dtype, prod(x.max_shape), device=x.device)).reshape(x.max_shape)
+  buf = UOp(Ops.ALLOC, src=UOp.device_range_src(x.device),
+            arg=ParamArg(next(UOp.unique_num), stg.dtype, prod(x.max_shape), device=x.device)).reshape(x.max_shape)
   view = buf.shrink_to(stg.shape)
   return view.after(view.store(x))
 
@@ -209,20 +212,20 @@ earliest_rewrites = mop_cleanup+PatternMatcher([
   # ** copy rules **
 
   # a copy to the same device as the source is not allowed: it is a no-op, STAGE materializes on the same device
-  (UPat(Ops.COPY, src=(UPat.var("x"),), name="copy"), lambda x,copy: x if x.device == copy.device else None),
+  (UPat(Ops.COPY, src=(UPat.var("x"),), allow_any_len=True, name="copy"), lambda x,copy: x if x.device == copy.device else None),
 
   # a COPY in src[1] of a plain STORE can just be removed: a STORE to a buffer on a different device is a COPY
-  (UPat(Ops.STORE, src=(UPat.var("dst"), UPat(Ops.COPY, src=(UPat.var("x"),), name="cpy"))),
+  (UPat(Ops.STORE, src=(UPat.var("dst"), UPat(Ops.COPY, src=(UPat.var("x"),), allow_any_len=True, name="cpy"))),
    lambda dst,x,cpy: dst.store(x) if dst.device == cpy.device and dst.has_buffer_identity(after_ok=True) else None),
 
   # a bare COPY is an anonymous store: realize it as a STORE into a fresh call-local buffer on the copy device
-  (UPat(Ops.COPY, src=(UPat.var("x"),), name="copy"), copy_to_anon_store),
+  (UPat(Ops.COPY, src=(UPat.var("x"),), allow_any_len=True, name="copy"), copy_to_anon_store),
 
   # ** stage rules **
 
   # a STAGE of an already materialized value (or of a COPY, which materializes itself) is a no-op
-  (UPat(Ops.STAGE, src=(UPat.var("x"),), name="stg"),
-   lambda x,stg: x if x.has_buffer_identity(after_ok=True) or x.op is Ops.COPY else None),
+  (UPat(Ops.STAGE, src=(UPat.var("x"),)),
+   lambda x: x if x.has_buffer_identity(after_ok=True) or x.op is Ops.COPY else None),
 
   # a bare STAGE is an anonymous same-device materialization: realize it as a STORE into a fresh call-local buffer
   (UPat(Ops.STAGE, src=(UPat.var("x"),), name="stg"), stage_to_anon_store),
@@ -243,8 +246,8 @@ earliest_rewrites = mop_cleanup+PatternMatcher([
   # remove two STOREs that store the same thing to the same place: TestSchedule.test_dedup_Assign
   (UPat.var("buf").after(UPat.var("buf").store(UPat.var("src")), name="a1").after(UPat.var("a1").store(UPat.var("src"))), lambda buf,src,a1:a1),
 
-  # store a buffer's own current contents back into itself: TestAssign.test_nested_after_contiguous_store_no_init
-  (UPat.var("buf").after(UPat.var("buf").store(UPat.var("buf").after(UPat.var("buf").store(UPat.var("src")), name="a1"))), lambda buf,src,a1:a1),
+  # store a buffer's own current contents back into itself: TestAssign.test_assign_from_alias
+  (UPat.var("buf").after(UPat.var("buf").store(UPat.var("buf").after(UPat.var("buf").store(UPat()), name="a1"))), lambda buf,a1:a1),
 
   # move bitcast from store dest to source: TestAssign.test_assign_bitcast
   (UPat(Ops.STORE, src=(UPat(Ops.BITCAST, src=(UPat(name="target"),)), UPat(name="src"))),
