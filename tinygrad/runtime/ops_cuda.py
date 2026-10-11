@@ -4,7 +4,7 @@ from tinygrad.helpers import DEBUG, DEV, getenv, unwrap
 from tinygrad.device import Buffer, BufferStorage, BufferSpec, Allocator, Compiled, MMIOInterface, HCQ_RUNTIME_DEV
 from tinygrad.dtype import dtypes
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, uopfunc
-from tinygrad.engine.realize import get_call_arg_uops, get_call_var_uops
+from tinygrad.engine.realize import get_call_kernel_args
 from tinygrad.renderer.cstyle import CUDARenderer, NVCCRenderer
 from tinygrad.renderer.ptx import PTXRenderer
 from tinygrad.runtime.autogen import cuda
@@ -20,7 +20,7 @@ def check(status:int):
 def as_int(handle) -> int: return unwrap(ctypes.cast(handle, ctypes.c_void_p).value)
 
 def host_stamp(slot:int): ctypes.c_uint64.from_address(slot).value = time.perf_counter_ns()
-def extern(ptr:int, meta=None) -> Buffer: return Buffer(HCQ_RUNTIME_DEV.value, 1, dtypes.uint64, opaque=BufferStorage(ptr, meta))
+def extern(ptr:int, meta=None) -> Buffer: return Buffer(HCQ_RUNTIME_DEV.device, 8, opaque=BufferStorage(ptr, meta))
 
 # *****************
 # queue
@@ -41,8 +41,7 @@ class CUDAQueue(HWQueue):
   def extern(self, tag) -> UOp: return UOp.alloc((1,), dtypes.uint64, 0, device=self.devs[0]).rtag(tag).getaddr(self.dev.host)
 
   def exec(self, call:UOp, prg:UOp):
-    obj, bufs, vals = prg.to_elf(), get_call_arg_uops(call), get_call_var_uops(call, prg)
-    rows = layout_args([bufs[i].getaddr(self.devs) for i in prg.arg.globals] + [v.ccast(var.dtype) for v, var in zip(vals, prg.arg.vars)], 8)
+    obj, rows = prg.to_elf(), layout_args(get_call_kernel_args(call, prg, self.devs), 8)
     size = max([o + w.dtype.itemsize for o, w in rows], default=8) - 8
     addr = UOp(Ops.LINEAR, src=tuple(pack_args([(0, UOp.const(size, dtypes.uint64))] + rows, 8 + size)), arg="kernargs").getaddr(self.devs)
     # extra: [buffer pointer, &args, buffer size, &size, end]
@@ -76,9 +75,7 @@ class CUDAAllocator(Allocator['CUDADevice']):
     check((cuda.cuMemFreeHost if options.host or options.cpu_access else cuda.cuMemFree_v2)(storage.buf))
 
   def _map(self, buf:Buffer) -> BufferStorage:
-    if buf.device.startswith("CUDA"):
-      if buf.get_storage().host is None: raise RuntimeError(f"{buf.device} device memory is only reachable through the host")
-      return BufferStorage(buf._buf)
+    if buf.device.startswith("CUDA"): return BufferStorage(buf._buf)
     if (host:=buf.get_storage().host) is None or host.addr % mmap.PAGESIZE: raise RuntimeError(f"{buf.device} memory is not page aligned host memory")
     check(cuda.cuCtxSetCurrent(self.dev.context))
     if (status:=cuda.cuMemHostRegister_v2(host.addr, buf.nbytes, 0)) != cuda.CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED:
@@ -109,7 +106,7 @@ class CUDADevice(Compiled):
 
   @functools.cached_property
   def handles(self) -> Buffer:
-    return Buffer(HCQ_RUNTIME_DEV.value, 4, dtypes.uint64, initial_value=struct.pack("4Q", *[as_int(h) for h in (self.context, *self.streams)], 0))
+    return Buffer(HCQ_RUNTIME_DEV.device, 32, initial_value=struct.pack("4Q", *[as_int(h) for h in (self.context, *self.streams)], 0))
 
   @functools.cached_property
   def stamp(self) -> Buffer: return extern(as_int(fn:=cuda.CUhostFn(host_stamp)), fn)

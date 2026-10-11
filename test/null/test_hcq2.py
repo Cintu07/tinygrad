@@ -3,9 +3,10 @@ from typing import cast
 from types import SimpleNamespace
 from collections import defaultdict
 from unittest.mock import patch
-from tinygrad import Device, Tensor, TinyJit, dtypes
+from tinygrad import Device, Tensor, TinyJit, Variable, dtypes
 from tinygrad.device import Buffer, Compiled, ProfileGraphEvent
 from tinygrad.helpers import Context, unwrap, to_tuple
+from tinygrad.dtype import AddrSpace
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo
 from tinygrad.engine.realize import compile_linear, link_linear, get_call_arg_uops, lower_and_compile, run_linear
 import tinygrad.runtime.support.hcq2 as hcq2
@@ -17,6 +18,10 @@ def lower_hcq(*body:UOp) -> UOp: # body through lower_call, as a linear
 def chain(x:Tensor, n:int) -> Tensor:
   for _ in range(n): x = (x + 1).contiguous()
   return x
+
+def add_n(n:UOp, C:UOp, B:UOp) -> UOp:
+  i = UOp.range(C.numel(), 0)
+  return C[i].store(B[i] + n).end(i).sink(arg=KernelInfo(name="add_n"))
 
 def chain_input(value:int=2, device="NULL") -> Tensor: return Tensor.full((4,), value, dtype=dtypes.int32, device=device).contiguous().realize()
 
@@ -38,7 +43,7 @@ def scheduled(*ts:Tensor, **kwargs) -> list[UOp]:
     lin = orig(l, profile)
     batches.extend(c for c in lin.src if c.op is Ops.CALL and isinstance(c.arg.aux, HCQInfo))
     return lin
-  with patch.object(hcq2, "sched_batches", track): compile_linear(ts[0].schedule_linear(*ts[1:]), **kwargs)
+  with patch.object(hcq2, "sched_batches", track): compile_linear(ts[0].linear_with_vars(*ts[1:])[0], **kwargs)
   return batches
 
 def queues(batch:UOp) -> dict[tuple[str, str], list[UOp]]:
@@ -69,8 +74,8 @@ def run(batch:UOp, done:dict[str, int]|None=None, prio:list|None=None) -> tuple[
         sig, target = mem[word(c.src[0])], val(c.src[1])
         if sig != target if c.arg[0] == "wait_eq" else sig < target: continue
       elif c.op is Ops.INS and c.arg[0] == "store":
-        mem[word(c.src[0])] = val(c.src[1])
-        if word(c.src[0])[0].tag == "timeline": log.append(q[0])
+        mem[w:=word(c.src[0])] = val(c.src[1])
+        if w[0].tag == "timeline": log.append(w[0].device)
       elif c.op is Ops.CALL: log.append(cs.index(c))
       cmds.pop(0)
       break
@@ -81,14 +86,14 @@ def orders(batch:UOp) -> set[tuple[int, ...]]: return {tuple(x for x in run(batc
 
 class TestHCQ2Deps(unittest.TestCase):
   def test_buffer_views(self):
-    b = Buffer("NULL", 16, dtypes.uint8)
+    b = Buffer("NULL", 16)
     for write in ([], [0]):
       tracker = hcq2.DepsTracker()
       tracker.access_resources([b], write, 0)
-      self.assertEqual(tracker.access_resources([b.view(4, dtypes.uint16, 4)], [0], 1), [0])
-      self.assertEqual(tracker.access_resources([b.view(4, dtypes.uint8, 0)], [0], 2), [0])
-      self.assertEqual(tracker.access_resources([b.view(4, dtypes.uint8, 12)], [0], 3), [0])
-      self.assertEqual(tracker.access_resources([b.view(8, dtypes.uint8, 4)], [], 4), [1])
+      self.assertEqual(tracker.access_resources([b.view(8, 4)], [0], 1), [0])
+      self.assertEqual(tracker.access_resources([b.view(4, 0)], [0], 2), [0])
+      self.assertEqual(tracker.access_resources([b.view(4, 12)], [0], 3), [0])
+      self.assertEqual(tracker.access_resources([b.view(8, 4)], [], 4), [1])
 
   def test_dependencies_through_selected_slices(self):
     b = UOp.param(0, dtypes.float32, 64, device=("NULL", "NULL:1"))
@@ -160,6 +165,12 @@ class TestHCQ2Schedule(unittest.TestCase):
   def test_a_peer_kernel_runs_after_the_copy_that_feeds_it(self):
     self.assertEqual(orders(self.batch((self.x.to("NULL:1") + 1).contiguous())), {(0, 1)})
 
+  def test_a_copy_waits_for_the_kernel_when_the_scalar_is_first(self):
+    n, B = Tensor(Variable("n", 0, 10, dtypes.int).bind(5)), Tensor.ones(4, dtype=dtypes.int).contiguous().realize()
+    b = self.batch(Tensor.custom_kernel(n, Tensor.empty(4, dtype=dtypes.int), B, fxn=add_n)[1].to("NULL:1"))
+    kernel = next(i for i, c in enumerate(calls(b)) if c.body.op is Ops.PROGRAM)
+    self.assertEqual({o[0] for o in orders(b)}, {kernel})
+
   def test_lanes_of_a_sharded_kernel_do_not_wait_for_each_other(self):
     s = Tensor.ones(8).contiguous().realize().shard(("NULL", "NULL:1"), axis=0).contiguous().realize()
     b = self.batch((s + 1).contiguous())
@@ -208,7 +219,7 @@ class TestHCQ2Link(unittest.TestCase):
     linear = compile_linear(chain(a, 2).schedule_linear(), input_uops=inputs, cache=True)
     linked = link_linear(linear, input_uops=inputs)
     self.assertIs(link_linear(linear, input_uops=[chain_input(3).uop.base, *inputs[1:]]), linked)
-    bufs = [cast(Buffer, u.buffer) for u in linked.toposort() if u.op is Ops.BUFFER]
+    bufs = [cast(Buffer, u.buffer) for u in linked.toposort() if u.op is Ops.BUFFER and u.addrspace is AddrSpace.GLOBAL]
     self.assertNotIn(a.uop.base.buffer, bufs)
     words = [w for b in bufs if b.options.external_ptr and b.nbytes % 8 == 0 for w in b.host.view(fmt='Q')[:]]
     self.assertNotIn(cast(Buffer, a.uop.base.buffer)._buf, words)

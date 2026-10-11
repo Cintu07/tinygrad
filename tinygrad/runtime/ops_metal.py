@@ -9,7 +9,7 @@ from tinygrad.runtime.autogen import metal
 from tinygrad.runtime.support.c import DLL
 from tinygrad.runtime.support.hcq2 import HWQueue, ccall, patch, layout_args, to_name
 from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, uopfunc
-from tinygrad.engine.realize import get_call_arg_uops, get_call_var_uops
+from tinygrad.engine.realize import get_call_kernel_args
 
 # 13 is requestType that metal uses to compile source code into MTLB, there aren't any docs or symbols.
 REQUEST_TYPE_COMPILE = 13
@@ -132,8 +132,7 @@ class MetalQueue(HWQueue):
     self.rows, self.cmds, self.sizes, self.stamps, self.nbytes = list[tuple[int, UOp]](), list[tuple](), list[tuple[int, int]](), list[UOp](), 0
 
   def exec(self, call:UOp, prg:UOp):
-    bufs, vals, obj = get_call_arg_uops(call), get_call_var_uops(call, prg), prg.to_elf()
-    args = [bufs[i].getaddr(self.devs) for i in prg.arg.globals] + [v.ccast(var.dtype) for v, var in zip(vals, prg.arg.vars)]
+    args, obj = get_call_kernel_args(call, prg, self.devs), prg.to_elf()
     self.rows += (rows:=layout_args(args, off:=round_up(self.nbytes, 256)))
     self.nbytes = max([o + w.dtype.itemsize for o, w in rows], default=off + 8)
 
@@ -222,7 +221,7 @@ class MetalDevice(Compiled):
   @functools.cached_property
   def handles(self) -> Buffer:
     vals = [self.queue.value, self.event.value, self.fence.value, ctypes.addressof(self.table), len(self.resources)]
-    return Buffer(self.host, len(vals), dtypes.uint64, initial_value=struct.pack(f"{len(vals)}Q", *vals))
+    return Buffer(self.host, len(vals) * 8, initial_value=struct.pack(f"{len(vals)}Q", *vals))
 
   def mark_resident(self, mtl:metal.MTLBuffer, add:bool):
     if self.residency.value is not None:
@@ -236,7 +235,7 @@ class MetalDevice(Compiled):
     if "handles" in self.__dict__: self.handles.host.view(fmt='Q')[3:5] = array.array('Q', [ctypes.addressof(self.table), len(self.resources)])
 
   def new_slots(self, n:int) -> Buffer:
-    self.profile_slots.add(buf:=Buffer(self.host, n, dtypes.uint64, initial_value=bytes(8 * n)))
+    self.profile_slots.add(buf:=Buffer(self.host, n * 8, initial_value=bytes(8 * n)))
     return buf
 
   @functools.cache
@@ -249,7 +248,7 @@ class MetalDevice(Compiled):
 
   def new_icb(self, cmds:tuple[tuple[bytes, str, tuple[int, ...], int], ...], header:int) -> Buffer:
     pipes = dedup(c[:2] for c in cmds)
-    buf = Buffer(self.device, header + 8 * (1 + len(cmds) + len(pipes)), dtypes.uint8, options=BufferSpec(nolru=True), preallocate=True)
+    buf = Buffer(self.device, header + 8 * (1 + len(cmds) + len(pipes)), options=BufferSpec(nolru=True), preallocate=True)
     desc = metal.MTLIndirectCommandBufferDescriptor.new()
     desc.setCommandTypes(metal.MTLIndirectCommandTypeConcurrentDispatch)
     desc.setMaxKernelBufferBindCount(1)
@@ -274,7 +273,7 @@ class MetalDevice(Compiled):
   def synchronize(self, timeout:int|None=None):
     for buf in list(self.profile_slots): # pending: [command buffer, 0]
       slots = buf.host.view(fmt='Q')
-      for start in range(5, buf.size, 4):
+      for start in range(5, buf.nbytes // 8, 4):
         if slots[start] and not slots[start + 2]:
           (cb:=metal.MTLCommandBuffer(slots[start])).waitUntilCompleted()
           slots[start], slots[start + 2] = int(cb.GPUStartTime() * 1e9), int(cb.GPUEndTime() * 1e9)

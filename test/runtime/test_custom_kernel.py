@@ -1,5 +1,7 @@
-import unittest
-from tinygrad import Tensor, UOp, GlobalCounters, Context, Device
+import unittest, functools
+from tinygrad import Tensor, UOp, GlobalCounters, Context, Device, Variable, TinyJit
+from tinygrad.engine.realize import run_linear
+from tinygrad.codegen import to_program
 import numpy as np
 from tinygrad.dtype import AddrSpace, dtypes, Invalid
 from tinygrad.helpers import getenv
@@ -34,6 +36,25 @@ def custom_ignore_first_kernel(C:UOp, A:UOp, B:UOp) -> UOp:
   C, B = C.flatten(), B.flatten()
   i = UOp.range(C.numel(), 0)
   return C[i].store(B[i] + 1).end(i).sink(arg=KernelInfo(name=f"ignore_first_{C.numel()}"))
+
+def custom_add_var_kernel(*srcs:UOp, n_slot:int) -> UOp:
+  C, *Bs = [s.flatten() for i,s in enumerate(srcs) if i != n_slot]
+  i = UOp.range(C.numel(), 0)
+  out = functools.reduce(lambda a,b: a+b, [B[i] for B in Bs]) + srcs[n_slot]
+  return C[i].store(out).end(i).sink(arg=KernelInfo(name=f"add_var_{n_slot}_{len(Bs)}"))
+
+def run_kernel_args(out:Tensor, name:str) -> list[str|None]:
+  linear, var_vals = out.linear_with_vars()
+  sink = [u for u in linear.toposort(enter_calls=True) if u.op is Ops.SINK and isinstance(u.arg, KernelInfo) and u.arg.name == name][0]
+  sig = to_program(sink, Device[Device.DEFAULT].renderer).to_elf().signature
+  run_linear(linear, var_vals)
+  return [nm for nm, *_ in sig]
+
+def custom_ignore_first_var_kernel(C:UOp, A:UOp, B:UOp, n:UOp) -> UOp:
+  C, B = C.flatten(), B.flatten()
+  k = UOp.variable("k", 0, 100, dtype=dtypes.int)
+  i = UOp.range(C.numel(), 0)
+  return C[i].store(B[i] + n + k).end(i).sink(arg=KernelInfo(name=f"ignore_first_var_{C.numel()}"))
 
 def custom_sum(B:UOp, A:UOp) -> UOp:
   i = UOp.range(A.shape[0], 0, axis_type=AxisType.LOOP)
@@ -180,6 +201,61 @@ class TestCustomKernel(unittest.TestCase):
     out = Tensor.custom_kernel(Tensor.empty(4), a, b, fxn=custom_ignore_first_kernel)[0]
     self.assertEqual(out.tolist(), [2, 3, 4, 5])
 
+  def test_scalar_arg_any_position(self):
+    for n_slot in range(3):
+      with self.subTest(n_slot=n_slot):
+        srcs = [Tensor.empty(4, dtype=dtypes.int), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()]
+        srcs.insert(n_slot, Tensor(Variable("n", 0, 100, dtypes.int).bind(5)))
+        out = Tensor.custom_kernel(*srcs, fxn=functools.partial(custom_add_var_kernel, n_slot=n_slot))[1 if n_slot == 0 else 0]
+        self.assertEqual(run_kernel_args(out, f"add_var_{n_slot}_1"), ["n" if i == n_slot else None for i in range(3)])
+        self.assertEqual(out.tolist(), [6, 7, 8, 9])
+
+  @unittest.skipIf(Device.DEFAULT == "PYTHON", "needs a device that isnt the default")
+  def test_scalar_arg_first_other_device(self):
+    srcs = [Tensor(Variable("n", 0, 100, dtypes.int).bind(5), device="PYTHON"), Tensor.empty(4, dtype=dtypes.int, device="PYTHON"),
+            Tensor([1, 2, 3, 4], dtype=dtypes.int, device="PYTHON").realize()]
+    out = Tensor.custom_kernel(*srcs, fxn=functools.partial(custom_add_var_kernel, n_slot=0))[1]
+    self.assertEqual(out.tolist(), [6, 7, 8, 9])
+
+  def test_scalar_arg_with_other_variable(self):
+    other = (Tensor([1, 2, 3, 4], dtype=dtypes.int) + Tensor(Variable("m", 0, 100, dtypes.int).bind(70))).contiguous()
+    srcs = [Tensor.empty(4, dtype=dtypes.int), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize(), Tensor(Variable("n", 0, 100, dtypes.int).bind(5))]
+    out = Tensor.custom_kernel(*srcs, fxn=functools.partial(custom_add_var_kernel, n_slot=2))[0]
+    Tensor.realize(other, out)
+    self.assertEqual(out.tolist(), [6, 7, 8, 9])
+
+  def test_scalar_arg_past_registers(self):
+    # 9 inputs with the scalar between pointers, x86 passes the ones after the 6th (4th on windows) on the stack. every buffer differs
+    srcs = [Tensor.empty(4, dtype=dtypes.int)] + [Tensor([k, 2*k, 3*k, 4*k], dtype=dtypes.int).realize() for k in range(1, 8)]
+    srcs.insert(4, Tensor(Variable("n", 0, 100, dtypes.int).bind(5)))
+    out = Tensor.custom_kernel(*srcs, fxn=functools.partial(custom_add_var_kernel, n_slot=4))[0]
+    self.assertEqual(run_kernel_args(out, "add_var_4_7"), [None]*4 + ["n"] + [None]*4)
+    self.assertEqual(out.tolist(), [33, 61, 89, 117])
+
+  def test_unused_arg_then_var(self):
+    srcs = (Tensor.empty(4, dtype=dtypes.int), Tensor.empty(4, dtype=dtypes.int), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize(),
+            Tensor(Variable("n", 0, 100, dtypes.int).bind(5)))
+    out = Tensor.custom_kernel(*srcs, fxn=custom_ignore_first_var_kernel)[0]
+    linear, var_vals = out.linear_with_vars()
+    run_linear(linear, {**var_vals, "k": 10})
+    self.assertEqual(out.tolist(), [16, 17, 18, 19])
+
+  def test_scalar_arg_jit(self):
+    # the scalar changes every call, a replay must not keep the value it was captured with
+    kernel = functools.partial(custom_add_var_kernel, n_slot=0)
+    jf = TinyJit(lambda B, n: Tensor.custom_kernel(Tensor(n), Tensor.empty(4, dtype=dtypes.int), B, fxn=kernel)[1].realize())
+    B, n = Tensor([1, 2, 3, 4], dtype=dtypes.int).realize(), Variable("n", 0, 100, dtypes.int)
+    for k in range(1, 6): self.assertEqual(jf(B, n.bind(k)).tolist(), [1+k, 2+k, 3+k, 4+k])
+
+  def test_scalar_arg_jit_fixed_bind(self):
+    # m is bound inside the jitted function so it's not an input, a replay keeps m=10 while the input n changes
+    kernel = functools.partial(custom_add_var_kernel, n_slot=0)
+    def f(B, n):
+      Bm = Tensor.custom_kernel(Tensor(Variable("m", 0, 100, dtypes.int).bind(10)), Tensor.empty(4, dtype=dtypes.int), B, fxn=kernel)[1]
+      return Tensor.custom_kernel(Tensor(n), Tensor.empty(4, dtype=dtypes.int), Bm, fxn=kernel)[1].realize()
+    jf, B, n = TinyJit(f), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize(), Variable("n", 0, 100, dtypes.int)
+    for k in range(1, 6): self.assertEqual(jf(B, n.bind(k)).tolist(), [11+k, 12+k, 13+k, 14+k])
+
   def test_sum(self):
     a = Tensor([1.0, 2, 3, 4, 5])
     tst = Tensor.empty(1)
@@ -251,6 +327,16 @@ class TestCustomKernel(unittest.TestCase):
     a = Tensor.arange(32).reshape(4, 8).float().contiguous().realize()
     self.assertEqual(Tensor.custom_kernel(Tensor.empty(4), a, fxn=kernel)[0].tolist(), (a*2).sum(1).tolist())
 
+  @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_local, "test requires locals")
+  def test_stage_in_thread_range(self):
+    # the STAGE is inside the thread range i, so every thread stages its own row
+    def kernel(C:UOp, A:UOp) -> UOp:
+      i, j, jj = UOp.range(4, 0, AxisType.LOCAL), UOp.range(8, 1, AxisType.LOOP), UOp.range(8, 2, AxisType.LOOP)
+      stage = (A[i, j] * 2).bufferize(j, arg=BufferizeOpts(None, AddrSpace.LOCAL))
+      return C[i].store(stage.index(jj).reduce(jj, arg=Ops.ADD)).end(i).sink(arg=KernelInfo(opts_to_apply=()))
+    a = Tensor.arange(32).reshape(4, 8).float().contiguous().realize()
+    self.assertEqual(Tensor.custom_kernel(Tensor.empty(4), a, fxn=kernel)[0].tolist(), (a*2).sum(1).tolist())
+
   @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, PTXRenderer), "PTX does not support dynamic register indexing")
   def test_reg_stage_then_reduce(self):
     # the REG buffer of the STAGE and the accumulator of the reduce are different buffers
@@ -292,7 +378,6 @@ class TestCustomKernel(unittest.TestCase):
     self.assertTrue(tst.allclose(a@b, atol=1e-3).item())
 
   def test_gemm_backward_custom(self): self.test_gemm_backward(True)
-  # NOTE: grad_fxn doesn't work with pyrender
   def test_gemm_backward(self, custom_backward_gemm=False):
     N = 4
     a_rand = Tensor.randn(N, 8)
@@ -579,6 +664,22 @@ class TestCallInKernel(unittest.TestCase):
     out = Tensor.custom_kernel(Tensor.zeros(4, dtype=dtypes.int).clone().realize(), a, fxn=kernel)[0]
     self.assertEqual(out.tolist(), [1, 1, 8, 1])
 
+  def test_call_body_range_is_not_ours(self):
+    @uopfunc
+    def mul(out:UOp, A:UOp):
+      k = UOp.range(4, 0)
+      return out[k].store(A[k]*3).end(k).sink()
+
+    def kernel(C:UOp, A:UOp):
+      m, i, call = UOp.range(3, 1), UOp.range(4, 0), mul(C, A)
+      self.assertIn(i, call.body.toposort())
+      end_m = C.after(call)[m].store(A[m]).end(m)
+      return C.after(end_m)[i].store(A[i]+1).end(i).sink(arg=KernelInfo(name="call_body_range", opts_to_apply=()))
+
+    a = Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()
+    out = Tensor.custom_kernel(Tensor.zeros(4, dtype=dtypes.int).clone().realize(), a, fxn=kernel)[0]
+    self.assertEqual(out.tolist(), [2, 3, 4, 5])
+
   @unittest.expectedFailure
   def test_call_loop_mini_opts(self): self.test_call_loop_mini(opts=None)
 
@@ -776,6 +877,19 @@ class TestUnshardStore(unittest.TestCase):
     a = Tensor(np.arange(32, dtype=np.float32).reshape(2, 4, 2, 2))
     out = _run_fragment_kernel(self, kernel, (2, 4, 2, 2), inputs=(a,))
     np.testing.assert_allclose(out, a.numpy(), atol=1e-4)
+
+  @unittest.skipIf(not Device[Device.DEFAULT].renderer.has_local, "fragment tests need LOCAL ranges")
+  def test_store_unshard_value_2axis_reshape(self):
+    # the reshape keeps both sharded axes, each with its own shard count (4 and 2)
+    def kernel(C:UOp, A:UOp) -> UOp:
+      ty = UOp.range(4, 0, AxisType.LOCAL)
+      tx = UOp.range(2, 1, AxisType.LOCAL)
+      frag = UOp.placeholder((2, 1, 1, 2), dtypes.float32, 0, AddrSpace.REG).unshard((1, 2), (ty, tx))
+      v = (frag.after(frag.store(0.0)) + A).reshape(2, 4, 2, 2, 1)
+      return C.store(v).end(tx, ty).sink(arg=KernelInfo(name="store_unshard_2axis_reshape", opts_to_apply=()))
+    a = Tensor(np.arange(32, dtype=np.float32).reshape(2, 4, 2, 2))
+    out = _run_fragment_kernel(self, kernel, (2, 4, 2, 2, 1), inputs=(a,))
+    np.testing.assert_allclose(out, a.numpy().reshape(2, 4, 2, 2, 1), atol=1e-4)
 
   def _test_store_load_fragment(self, addrspace:AddrSpace):
     # thread ty stores A[ty*8:ty*8+8] into its fragment, then reads it back into the same slice of C
