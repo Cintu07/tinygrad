@@ -134,8 +134,8 @@ def unwrap_multi(call:UOp, resolved:list[UOp]) -> Iterator[tuple[list[Buffer], d
   if not any(isinstance(b, MultiBuffer) for b in bufs): yield cast(list[Buffer], bufs), {}
   else:
     # the DEVICE axis is bound per device at launch: it's a RANGE in the AST and the _device_num variable after codegen
-    # on archs like x86, stack args (after the 6th) aren't PARAMs in the body, so also check the PROGRAM's vars
-    has_dnum = ((isinstance(call.body.arg, ProgramInfo) and any(v.arg.name == '_device_num' for v in call.body.arg.vars)) or
+    # on archs like x86, stack args (after the 6th) aren't PARAMs in the body, so also check the PROGRAM's kernel_params
+    has_dnum = ((isinstance(call.body.arg, ProgramInfo) and any(p.arg.name == '_device_num' for p in call.body.kernel_params)) or
                 any((x.op is Ops.RANGE and x.axis_type is AxisType.DEVICE) or (x.op is Ops.PARAM and x.arg.name == '_device_num')
                     for x in call.body.toposort()))
     lanes = max(len(b.bufs) for b in bufs if isinstance(b, MultiBuffer)) # a single buffer is shared by every lane
