@@ -90,7 +90,7 @@ string_rewrite = PatternMatcher([
   (UPat((Ops.CMPLT, Ops.CMPNE, Ops.CMPEQ), name="x", allow_any_len=True, src=(UPat.var("src0"),)),
     lambda ctx, x, src0: ctx.code_for_op[x.op](ctx.r[x], *[ctx.r[v] for v in x.src], src0.dtype, ctx.types[src0.dtype])),
   (UPat(GroupOp.ALU, name="x"), lambda ctx, x: ctx.code_for_op[x.op](ctx.r[x], *[ctx.r[v] for v in x.src], x.dtype, ctx.types[x.dtype])),
-  (UPat(Ops.BITCAST, name="x", src=(UPat.var("a"),), allow_any_len=True), lambda ctx, x, a: f"mov.b{ctx.types[x.dtype][1:]} {ctx.r[x]}, {ctx.r[a]};"),
+  (UPat(Ops.BITCAST, name="x", src=(UPat.var("a"),)), lambda ctx, x, a: f"mov.b{ctx.types[x.dtype][1:]} {ctx.r[x]}, {ctx.r[a]};"),
   (UPat(Ops.CAST, name="x", src=(UPat(dtype=dtypes.bool, name="a"),)),
    lambda ctx, x, a: f"selp.b{ctx.types[x.dtype][1:]} {ctx.r[x]}, {render_val(1, x.dtype)}, {render_val(0, x.dtype)}, {ctx.r[a]};"),
   (UPat(Ops.CAST, name="x", src=(UPat.var("a"),)),
@@ -166,7 +166,7 @@ class PTXRenderer(Renderer):
     local_dims = [u.src[0] for u in uops if u.op is Ops.SPECIAL and u.arg[0] == "l"]
     launch_bounds = prod([d.vmax for d in local_dims])
     params = ',\n\t'.join([f".param .{'u64' if u.addrspace is AddrSpace.GLOBAL else self.types[u.dtype]} {name}" for name,u in bufs])
-    return f"{self.kernel_prefix.format(launch_bounds=launch_bounds)} {function_name} (\n\t{params}\n)\n.maxntid {launch_bounds}\n{{\n{kernel}\n}}"
+    return f"{self.kernel_prefix} {function_name} (\n\t{params}\n)\n.maxntid {launch_bounds}\n{{\n{kernel}\n}}"
 
   def render(self, uops:list[UOp]) -> str:
     kernel:list[str] = []
@@ -184,8 +184,9 @@ class PTXRenderer(Renderer):
 
     name = "test"
     for u in uops:
-      if u.op in {Ops.NOOP, Ops.GROUP, Ops.CONST}: continue
+      if u.op in {Ops.NOOP, Ops.CONST}: continue
       if u.op is Ops.AFTER:
+        if u.dtype is dtypes.void: continue
         self.r[u] = self.r[u.src[0]]
         continue
       if u.op is Ops.SINK:

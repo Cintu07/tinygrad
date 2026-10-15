@@ -86,21 +86,19 @@ from tinygrad.schedule.rangeify import get_kernel_graph
 from tinygrad.helpers import CAPTURING
 from tinygrad.uop.ops import PatternMatcher, UPat
 
-def create_new_buffer(ctx:tuple[dict[UOp, UOp], tuple[UOp, ...]], b:UOp):
-  if (ret:=ctx[0].get(b, None)) is None:
-    device = b.device if b.device is not None else next(a.device for a in ctx[1] if a.device is not None)
-    ctx[0][b] = ret = UOp.new_buffer(device, b.max_numel(), b.dtype)
-  return ret
+def create_new_buffer(ctx:tuple[UOp, ...], b:UOp):
+  device = b.device if b.device is not None else next(a.device for a in ctx if a.device is not None)
+  return UOp.new_buffer(device, b.max_numel(), b.dtype)
 
 pm_post_sched_cache = PatternMatcher([
   # Resolve positional arguments outside kernel bodies; free Variables have slot -1.
-  (UPat(Ops.PARAM, name="x"), lambda ctx,x: ctx[1][x.arg.slot] if x.arg.slot >= 0 else None),
+  (UPat(Ops.PARAM, name="x"), lambda ctx,x: ctx[x.arg.slot] if x.arg.slot >= 0 else None),
   # bind ALLOCs to fresh BUFFERs for this invocation
   (UPat(Ops.ALLOC, name="b"), create_new_buffer),
 ])
 
 def resolve_linear_call(linear_call:UOp, outer_binds:dict[int, UOp]|None=None):
-  linear = graph_rewrite(linear_call.body, pm_post_sched_cache, ctx=({}, linear_call.src[1:]), walk=True, name="params to buffers")
+  linear = graph_rewrite(linear_call.body, pm_post_sched_cache, ctx=linear_call.src[1:], walk=True, name="params to buffers")
   # nested LINEAR calls are lexical scopes: their positional params shadow the enclosing scope, while calls without
   # scalar args (e.g. precompiled allreduce) inherit it
   binds = {**(outer_binds or {}),
@@ -109,7 +107,7 @@ def resolve_linear_call(linear_call:UOp, outer_binds:dict[int, UOp]|None=None):
   def apply_binds(si:UOp) -> UOp:
     if si.op is Ops.CALL and si.body.op is Ops.LINEAR: return resolve_linear_call(si, binds)
     if si.op is Ops.CALL and si.body.op is Ops.PROGRAM: return si  # compiled parameters already have ABI slots
-    subs = {v:binds[v.arg.slot] for s in si.src for v in s.variables() if v.arg.slot in binds}
+    subs = {v:binds[v.arg.slot] for s in si.src for v in s.variables() if v.arg.name is None and v.arg.slot in binds}
     return si.replace(src=tuple(s.substitute(subs, name="resolve scalar params") for s in si.src))
   return linear.replace(src=tuple(apply_binds(si) for si in linear.src))
 
@@ -140,7 +138,6 @@ def lower_sink_to_linear(call:UOp) -> UOp|None:
   if (DEBUG >= 1 and len(linear.src) > 1) or DEBUG >= 3:
     for frm in inspect.stack():
       if frm.filename == "<string>": continue
-      if frm.filename.startswith(str(BASEDIR / "apps")): break
       if not frm.filename.startswith(str(BASEDIR)) and not frm.filename.endswith("/contextlib.py"): break
     else:
       frm = None
@@ -158,12 +155,12 @@ def assert_all_same_devices(ast:UOp):
   if len(devices) >= 2: raise RuntimeError(f"all buffers must be on the same device: {devices}")
 
 def copy_kernel_to_store(call:UOp, dst:UOp, src:UOp, r:UOp|None=None):
-  if dst.device == src.device and not (isinstance(dst.device, str) and dst.device.startswith("DISK")): return None
+  if dst.device == src.device and not dst.on_disk(): return None
   return call.replace(src=(dst.store(src),) + call.src[1:])
 
 def simplify_copy_kernel(call:UOp, ast:UOp, dst:UOp, src:UOp):
   # NOTE: this is a codegen for SDMA devices
-  if dst.device == src.device and not (isinstance(dst.device, str) and dst.device.startswith("DISK")): return None
+  if dst.device == src.device and not dst.on_disk(): return None
   from tinygrad.codegen.simplify import pm_flatten_range, pm_simplify_ranges
   from tinygrad.schedule.prepare import pm_mops
   from tinygrad.uop.symbolic import sym

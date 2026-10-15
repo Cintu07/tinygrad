@@ -5,7 +5,7 @@ from tinygrad.dtype import dtypes, DType, AddrSpace, Invalid
 from tinygrad.uop import Ops
 from tinygrad.uop.ops import AxisType, UOp, graph_rewrite, ParamArg, KernelInfo
 from tinygrad.uop.movement import mop_cleanup
-from tinygrad.uop.render import render_ssa
+from tinygrad.uop.render import render_uir
 from tinygrad.device import Device
 from tinygrad.codegen import full_rewrite_to_sink
 from tinygrad.helpers import Context, ansistrip
@@ -38,7 +38,7 @@ def _parse_paramarg(rest:str, name:str|None) -> ParamArg:
   kv = _kv(rest)
   def i(k:str) -> int|None: return int(kv[k]) if k in kv else None
   dev = kv.get("device")
-  return ParamArg(int(kv["slot"]), _DTYPES_BY_NAME[kv["dtype"]], i("size"),
+  return ParamArg(int(kv["slot"]), _DTYPES_BY_NAME[kv["dtype"]],
                   tuple(map(int, kv["bounds"].strip("[]").split(","))) if "bounds" in kv else None,
                   i("multiple_of"), name, AddrSpace[kv["addrspace"]] if "addrspace" in kv else AddrSpace.GLOBAL,
                   pyast.literal_eval(dev) if dev and dev[0] in "'(" else dev, kv.get("volatile") == "true")
@@ -48,9 +48,9 @@ def parse_ssa(text:str) -> UOp:
   nodes, root = {}, None
   def parse_tok(tok:str) -> UOp:
     if tok.startswith("%"): return nodes[int(tok[1:])]
-    if tok.startswith("("): return UOp(Ops.STACK, src=tuple(parse_tok(t) for t in tok[1:-1].split(", ")))
+    if tok.startswith("("): return UOp(Ops.STACK, src=tuple(parse_tok(t) for t in tok[1:-1].split(", ") if t))
     return _parse_const(tok)
-  for raw in ansistrip(text).splitlines():   # op names may carry ANSI color from render_ssa
+  for raw in ansistrip(text).splitlines():   # op names may carry ANSI color from render_uir
     line = raw.strip()
     if not line or line.startswith(";"): continue
     m = _line_re.match(line)
@@ -68,8 +68,8 @@ def parse_ssa(text:str) -> UOp:
     arg: Any = None
     if op in {Ops.PARAM, Ops.BUFFER, Ops.ALLOC}: arg = _parse_paramarg(argstr, name)
     elif op is Ops.RANGE:
-      t, r = argstr.split()
-      arg = (AxisType[t], *map(int, r[1:].split("_")))
+      t, *ids = argstr.split()
+      arg = (AxisType[t], *map(int, ids))
     elif op is Ops.REDUCE:
       kv = _kv(argstr)
       arg = (Ops[kv["op"].upper()], int(kv["pop"]) if "pop" in kv else 0)
@@ -86,17 +86,17 @@ def parse_ssa(text:str) -> UOp:
 
 def _strip_buffers(root:UOp) -> UOp:
   # realized BUFFERs carry runtime state the wire can't; a BUFFER with no binding is exactly an ALLOC
-  subs = {b: b.replace(op=Ops.ALLOC, arg=ParamArg(b.arg.slot, b.arg.dtype, b.arg.size, b.arg.vmin_vmax, b.arg.multiple_of,
+  subs = {b: b.replace(op=Ops.ALLOC, arg=ParamArg(b.arg.slot, b.arg.dtype, b.arg.vmin_vmax, b.arg.multiple_of,
                                                  b.arg.name, b.arg.addrspace, b.arg.device, b.arg.volatile))
           for b in root.toposort() if b.op is Ops.BUFFER and isinstance(b.arg, ParamArg)}
   return root.substitute(subs, walk=True, name="strip buffers for wire format test") if subs else root
 
 def assert_roundtrip(case, root:UOp):
-  txt = render_ssa(root)
+  txt = render_uir(root)
   parsed = parse_ssa(txt)
   # text + structural equality, both sides stripped: realized BUFFER vs parsed ALLOC converge to the same thing
   g1, g2 = _strip_buffers(root), _strip_buffers(parsed)
-  case.assertEqual(render_ssa(g1), render_ssa(g2))
+  case.assertEqual(render_uir(g1), render_uir(g2))
   case.assertEqual({x.tuplize for x in g1.toposort()}, {x.tuplize for x in g2.toposort()})
 
 class TestSSARender(unittest.TestCase):
@@ -156,7 +156,7 @@ class TestSSARender(unittest.TestCase):
   def test_continue_parsing(self):
     # lines out of order / comments tolerated, ids sparse
     g = UOp.sink(UOp.const(1) + UOp.const(2))
-    txt = "; hand written\n" + render_ssa(g) + "\n;; trailing comment\n"
+    txt = "; hand written\n" + render_uir(g) + "\n;; trailing comment\n"
     assert_roundtrip(self, parse_ssa(txt))
 
 if __name__ == '__main__': unittest.main()
