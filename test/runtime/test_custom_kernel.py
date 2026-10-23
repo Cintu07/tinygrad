@@ -48,6 +48,10 @@ def custom_range_kernel(r:UOp, C:UOp, B:UOp) -> UOp:
   i = UOp.range(r, 0)
   return C[i].store(B[i] + r).end(i).sink(arg=KernelInfo(name="range_r"))
 
+def run_range_kernel(v:int, B:Tensor) -> Tensor:
+  r = Tensor(Variable("r", 1, 4, dtypes.int).bind(v))
+  return Tensor.custom_kernel(r, Tensor.zeros(4, dtype=dtypes.int).contiguous(), B, fxn=custom_range_kernel)[1]
+
 def custom_add_nm_kernel(n:UOp, C:UOp, B:UOp, m:UOp) -> UOp:
   i = UOp.range(C.numel(), 0)
   return C[i].store(B[i] + n + m).end(i).sink(arg=KernelInfo(name="add_nm"))
@@ -268,9 +272,7 @@ class TestCustomKernel(unittest.TestCase):
   def test_scalar_arg_jit_fixed_bind_two_values(self):
     # one var bound to 4 and 2 in two kernels, each keeps its own value
     def f(B):
-      for r in (4, 2):
-        B = Tensor.custom_kernel(Tensor(Variable("r", 1, 4, dtypes.int).bind(r)), Tensor.zeros(4, dtype=dtypes.int).contiguous(), B,
-                                 fxn=custom_range_kernel)[1].realize()
+      for r in (4, 2): B = run_range_kernel(r, B).realize()
       return B
     jf, B = TinyJit(f), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()
     for _ in range(4): self.assertEqual(jf(B).tolist(), [7, 8, 0, 0])
@@ -278,15 +280,13 @@ class TestCustomKernel(unittest.TestCase):
   def test_scalar_arg_jit_fixed_bind_prune(self):
     # with prune, a kernel that doesn't use the jit input runs once at capture
     W = Tensor([10, 20, 30, 40], dtype=dtypes.int).realize()
-    def f(B):
-      r = Tensor(Variable("r", 1, 4, dtypes.int).bind(2))
-      return B + Tensor.custom_kernel(r, Tensor.zeros(4, dtype=dtypes.int).contiguous(), W, fxn=custom_range_kernel)[1].realize()
-    jf, B = TinyJit(f, prune=True), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()
+    jf, B = TinyJit(lambda B: B + run_range_kernel(2, W).realize(), prune=True), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()
     for _ in range(4): self.assertEqual(jf(B).tolist(), [13, 24, 3, 4])
 
   def test_scalar_arg_twice(self):
-    n = Tensor(Variable("n", 0, 100, dtypes.int).bind(3))
-    out = Tensor.custom_kernel(n, Tensor.empty(4, dtype=dtypes.int), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize(), n, fxn=custom_add_nm_kernel)[1]
+    # the same var passed twice is one kernel param, not two params with the same name
+    n, B = Tensor(Variable("n", 0, 100, dtypes.int).bind(3)), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()
+    out = Tensor.custom_kernel(n, Tensor.empty(4, dtype=dtypes.int), B, n, fxn=custom_add_nm_kernel)[1]
     self.assertEqual(out.tolist(), [7, 8, 9, 10])
 
   def test_sum(self):
