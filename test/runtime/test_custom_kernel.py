@@ -287,6 +287,7 @@ class TestCustomKernel(unittest.TestCase):
     # the same var passed twice is one kernel param, not two params with the same name
     n, B = Tensor(Variable("n", 0, 100, dtypes.int).bind(3)), Tensor([1, 2, 3, 4], dtype=dtypes.int).realize()
     out = Tensor.custom_kernel(n, Tensor.empty(4, dtype=dtypes.int), B, n, fxn=custom_add_nm_kernel)[1]
+    self.assertEqual(run_kernel_args(out, "add_nm"), ["n", None, None])
     self.assertEqual(out.tolist(), [7, 8, 9, 10])
 
   def test_sum(self):
